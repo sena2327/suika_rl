@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -34,20 +35,27 @@ import suika_env  # noqa: F401  # Registers "SuikaEnv-v0"
 
 
 class SuikaObsWrapper(gym.ObservationWrapper):
-    """Convert image HWC->CHW for Torch CNN and keep score as float32."""
+    """Convert image HWC->CHW and keep aux features for policy input."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
         img_space = env.observation_space["image"]
-        score_space = env.observation_space["score"]
+        fruit_type_space = env.observation_space["current_fruit_type"]
+        fruit_x_space = env.observation_space["current_fruit_x"]
         h, w, c = img_space.shape
         self.observation_space = spaces.Dict(
             {
                 "image": spaces.Box(low=0, high=255, shape=(c, h, w), dtype=np.uint8),
-                "score": spaces.Box(
-                    low=score_space.low.astype(np.float32),
-                    high=score_space.high.astype(np.float32),
-                    shape=score_space.shape,
+                "current_fruit_type": spaces.Box(
+                    low=fruit_type_space.low.astype(np.float32),
+                    high=fruit_type_space.high.astype(np.float32),
+                    shape=fruit_type_space.shape,
+                    dtype=np.float32,
+                ),
+                "current_fruit_x": spaces.Box(
+                    low=fruit_x_space.low.astype(np.float32),
+                    high=fruit_x_space.high.astype(np.float32),
+                    shape=fruit_x_space.shape,
                     dtype=np.float32,
                 ),
             }
@@ -55,12 +63,13 @@ class SuikaObsWrapper(gym.ObservationWrapper):
 
     def observation(self, observation):
         image = np.transpose(observation["image"], (2, 0, 1)).copy()
-        score = observation["score"].astype(np.float32, copy=False)
-        return {"image": image, "score": score}
+        fruit_type = observation["current_fruit_type"].astype(np.float32, copy=False)
+        fruit_x = observation["current_fruit_x"].astype(np.float32, copy=False)
+        return {"image": image, "current_fruit_type": fruit_type, "current_fruit_x": fruit_x}
 
 
 class SuikaCombinedExtractor(BaseFeaturesExtractor):
-    """Small CNN for image + tiny MLP for score, then concatenate."""
+    """Small CNN for image + (fruit type embedding + position), then concatenate."""
 
     def __init__(self, observation_space: spaces.Dict):
         super().__init__(observation_space, features_dim=1)
@@ -79,16 +88,76 @@ class SuikaCombinedExtractor(BaseFeaturesExtractor):
             sample = th.as_tensor(observation_space["image"].sample()[None]).float()
             n_flatten = self.cnn(sample).shape[1]
 
+        num_fruit_types = int(observation_space["current_fruit_type"].high[0]) + 1
+        self.fruit_type_embedding = nn.Embedding(num_fruit_types, 8)
         self.image_head = nn.Sequential(nn.Linear(n_flatten, 256), nn.ReLU())
-        self.score_head = nn.Sequential(nn.Linear(1, 16), nn.ReLU())
+        self.aux_head = nn.Sequential(nn.Linear(9, 16), nn.ReLU())
         self._features_dim = 256 + 16
 
     def forward(self, observations):
         img = observations["image"].float() / 255.0
-        score = observations["score"].float()
+        fruit_x = observations["current_fruit_x"].float()
+        fruit_type_idx = observations["current_fruit_type"].long().squeeze(1)
+        fruit_type_emb = self.fruit_type_embedding(fruit_type_idx)
+        aux = th.cat([fruit_type_emb, fruit_x], dim=1)
         img_feat = self.image_head(self.cnn(img))
-        score_feat = self.score_head(score)
-        return th.cat([img_feat, score_feat], dim=1)
+        aux_feat = self.aux_head(aux)
+        return th.cat([img_feat, aux_feat], dim=1)
+
+
+class SuikaFrameStackWrapper(gym.Wrapper):
+    """Stack last k image observations on channel axis (C*k, H, W)."""
+
+    def __init__(self, env: gym.Env, k: int = 3):
+        super().__init__(env)
+        self.k = max(1, int(k))
+        self._frames = deque(maxlen=self.k)
+        img_space = env.observation_space["image"]
+        fruit_type_space = env.observation_space["current_fruit_type"]
+        fruit_x_space = env.observation_space["current_fruit_x"]
+        c, h, w = img_space.shape
+        self.observation_space = spaces.Dict(
+            {
+                "image": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(c * self.k, h, w),
+                    dtype=np.uint8,
+                ),
+                "current_fruit_type": spaces.Box(
+                    low=fruit_type_space.low.astype(np.float32),
+                    high=fruit_type_space.high.astype(np.float32),
+                    shape=fruit_type_space.shape,
+                    dtype=np.float32,
+                ),
+                "current_fruit_x": spaces.Box(
+                    low=fruit_x_space.low.astype(np.float32),
+                    high=fruit_x_space.high.astype(np.float32),
+                    shape=fruit_x_space.shape,
+                    dtype=np.float32,
+                ),
+            }
+        )
+
+    def _build_obs(self, obs):
+        stacked = np.concatenate(list(self._frames), axis=0)
+        return {
+            "image": stacked,
+            "current_fruit_type": obs["current_fruit_type"],
+            "current_fruit_x": obs["current_fruit_x"],
+        }
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self._frames.clear()
+        for _ in range(self.k):
+            self._frames.append(obs["image"].copy())
+        return self._build_obs(obs), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._frames.append(obs["image"].copy())
+        return self._build_obs(obs), reward, terminated, truncated, info
 
 
 class BrowserRestartCallback(BaseCallback):
@@ -133,7 +202,48 @@ class BrowserRestartCallback(BaseCallback):
         return True
 
 
-def make_env(rank: int, seed: int, headless: bool, delay: float, port_base: int) -> Callable[[], gym.Env]:
+class FinalScoreLoggingCallback(BaseCallback):
+    """Log episode final score from info['score'] to W&B on done steps."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones", None)
+        infos = self.locals.get("infos", None)
+        if dones is None or infos is None:
+            return True
+
+        final_scores = []
+        for i, done in enumerate(np.asarray(dones).tolist()):
+            if not done:
+                continue
+            info = infos[i] if i < len(infos) else {}
+            score = info.get("score", None)
+            if score is None:
+                continue
+            final_scores.append(float(score))
+            wandb.log({"rollout/final_score": float(score)}, step=self.num_timesteps)
+
+        if final_scores:
+            mean_score = float(np.mean(final_scores))
+            self.logger.record("rollout/final_score_mean", mean_score)
+            if self.verbose > 0:
+                print(
+                    f"[FinalScoreLoggingCallback] step={self.num_timesteps} "
+                    f"final_score_mean={mean_score:.2f} n={len(final_scores)}"
+                )
+        return True
+
+
+def make_env(
+    rank: int,
+    seed: int,
+    headless: bool,
+    delay: float,
+    port_base: int,
+    frame_stack: int,
+) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env = gym.make(
             "SuikaEnv-v0",
@@ -146,6 +256,7 @@ def make_env(rank: int, seed: int, headless: bool, delay: float, port_base: int)
             ready_timeout=2.0,
         )
         env = SuikaObsWrapper(env)
+        env = SuikaFrameStackWrapper(env, k=frame_stack)
         env.reset(seed=seed + rank)
         return env
 
@@ -172,6 +283,7 @@ def parse_args():
         ),
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--frame-stack", type=int, default=1, help="Number of stacked image frames.")
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
@@ -223,7 +335,14 @@ def main():
     tb_dir.mkdir(parents=True, exist_ok=True)
 
     env_fns = [
-        make_env(i, args.seed, args.headless, args.delay_before_img_capture, args.port_base)
+        make_env(
+            i,
+            args.seed,
+            args.headless,
+            args.delay_before_img_capture,
+            args.port_base,
+            args.frame_stack,
+        )
         for i in range(args.n_envs)
     ]
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
@@ -239,6 +358,7 @@ def main():
             "total_timesteps": args.total_timesteps,
             "n_envs": args.n_envs,
             "seed": args.seed,
+            "frame_stack": args.frame_stack,
             "delay_before_img_capture": args.delay_before_img_capture,
             "headless": args.headless,
             "learning_rate": 3e-4,
@@ -274,7 +394,7 @@ def main():
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.01,
+            ent_coef=0.05,
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log=str(tb_dir),
@@ -291,6 +411,7 @@ def main():
             verbose=2,
         )
         callbacks = [wandb_callback]
+        callbacks.append(FinalScoreLoggingCallback(verbose=0))
         if args.restart_browser_every_steps > 0:
             callbacks.append(
                 BrowserRestartCallback(

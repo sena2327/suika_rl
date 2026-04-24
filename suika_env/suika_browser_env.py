@@ -29,6 +29,8 @@ class SuikaBrowserEnv(gymnasium.Env):
         wait_for_ready_on_step=False,
         ready_poll_interval=0.01,
         ready_timeout=2.0,
+        img_width=128,
+        img_height=128,
     ) -> None:
         self.game_url = f"http://localhost:{port}/"
         # Check if port is already in use
@@ -58,12 +60,13 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.wait_for_ready_on_step = wait_for_ready_on_step
         self.ready_poll_interval = ready_poll_interval
         self.ready_timeout = ready_timeout
-        self.img_width = 128
-        self.img_height = 128
+        self.img_width = int(img_width)
+        self.img_height = int(img_height)
         self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
-            'score': gymnasium.spaces.Box(low=0, high=1000000, shape=(1,), dtype="float32"),
+            'current_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
+            'current_fruit_x': gymnasium.spaces.Box(low=0, high=1, shape=(1,), dtype="float32"),
         }
         self.observation_space = gymnasium.spaces.Dict(_obs_dict)
         self.action_space = gymnasium.spaces.Box(low=0, high=1, shape=(1,))
@@ -90,7 +93,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         self._reload()
         info = {}
         self.score = 0
-        obs, status = self._get_obs_and_status()
+        obs, status, _ = self._get_obs_and_status()
         return obs, info
 
     def _reload(self):
@@ -121,23 +124,49 @@ class SuikaBrowserEnv(gymnasium.Env):
     
     def _get_obs_and_status(self):
         img = self._capture_canvas()
-        status, score = self.driver.execute_script('return [window.Game.stateIndex, window.Game.score];')
-        score = np.array([score], dtype=np.float32)
-        return dict(image=img, score=score), status
+        status, score, fruit_type, fruit_x = self.driver.execute_script("""
+            (() => {
+                const game = window.Game || {};
+                const status = Number.isFinite(game.stateIndex) ? game.stateIndex : 0;
+                const score = Number.isFinite(game.score) ? game.score : 0;
+                const fruitType = Number.isFinite(game.currentFruitSize) ? game.currentFruitSize : 0;
+                let x = 0.5;
+                const previewX = game?.elements?.previewBall?.position?.x;
+                if (Number.isFinite(previewX)) {
+                    x = previewX / 640.0;
+                } else {
+                    const input = document.getElementById("fruit-position");
+                    const parsed = Number(input?.value);
+                    if (Number.isFinite(parsed)) x = parsed / 640.0;
+                }
+                x = Math.max(0.0, Math.min(1.0, x));
+                return [status, score, fruitType, x];
+            })();
+        """)
+        return dict(
+            image=img,
+            current_fruit_type=np.array([fruit_type], dtype=np.float32),
+            current_fruit_x=np.array([fruit_x], dtype=np.float32),
+        ), status, float(score)
+
+    def capture_canvas_raw_rgba(self):
+        """Debug helper: return cropped canvas before resize."""
+        return self._capture_canvas_raw()
     
     def _capture_canvas(self):
+        img = Image.fromarray(self._capture_canvas_raw(), mode="RGBA")
+        imgResized = img.resize((self.img_width, self.img_height), RESAMPLE_LANCZOS)
+        arr = np.asarray(imgResized)
+        return arr
+
+    def _capture_canvas_raw(self):
         # screenshots the game canvas with id "game-canvas" and stores it in a numpy array
         canvas = self.driver.find_element(By.ID, 'game-canvas')
         image_string = canvas.screenshot_as_png
         img = Image.open(io.BytesIO(image_string)).convert("RGBA")
         # first crop out right hand side and lower bar.
-        img = img.crop((0,0,520,img.height))
-        arr = np.asarray(img)
-        # imageio.imwrite('cropped.png', arr)
-        # import ipdb; ipdb.set_trace()
-        imgResized = img.resize((self.img_width,self.img_height), RESAMPLE_LANCZOS)
-        arr = np.asarray(imgResized)
-        return arr
+        img = img.crop((0, 0, 520, img.height))
+        return np.asarray(img)
 
     
     def step(self, action):
@@ -158,12 +187,11 @@ class SuikaBrowserEnv(gymnasium.Env):
             elif self.delay_before_img_capture > 0:
                 time.sleep(self.delay_before_img_capture)
 
-            obs, status = self._get_obs_and_status()
+            obs, status, score = self._get_obs_and_status()
             reward = 0
             # check if game is over.
             terminal = status == 3
             truncated = False 
-            score = obs['score'].item()
             info['score'] = score
             reward += score - self.score
             self.score = score
