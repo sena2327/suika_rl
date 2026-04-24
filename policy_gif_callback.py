@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from pathlib import Path
-from typing import Callable
 
 import imageio.v2 as imageio
+import gymnasium as gym
 import numpy as np
+from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+
+import suika_env  # noqa: F401
 
 
 def _obs_to_hwc(obs_dict):
@@ -26,21 +29,45 @@ def _make_grid(images):
 
 
 def _generate_policy_gif_worker(
-    model,
-    make_eval_env: Callable[[int, int], object],
+    model_path: str,
     steps_per_gif: int,
     fps: int,
     gif_path: str,
     export_idx: int,
     num_timesteps: int,
     verbose: int,
+    seed: int,
+    headless: bool,
+    frame_stack: int,
+    port_base: int,
 ):
-    envs = [make_eval_env(i, export_idx) for i in range(4)]
+    # Import wrappers lazily to avoid import cycle at module import time.
+    from train import SuikaFrameStackWrapper, SuikaObsWrapper
+
+    model = PPO.load(model_path, device="cpu")
+
+    def make_eval_env(rank: int):
+        port = port_base + 1000 + rank
+        env = gym.make(
+            "SuikaEnv-v0",
+            headless=headless,
+            delay_before_img_capture=0.0,
+            port=port,
+            mute_sound=True,
+            wait_for_ready_on_step=True,
+            ready_poll_interval=0.02,
+            ready_timeout=2.0,
+        )
+        env = SuikaObsWrapper(env)
+        env = SuikaFrameStackWrapper(env, k=frame_stack)
+        return env
+
+    envs = [make_eval_env(i) for i in range(4)]
     frames = []
     try:
         obs_list = []
         for i, env in enumerate(envs):
-            obs, _ = env.reset(seed=1000 * export_idx + i)
+            obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
             obs_list.append(obs)
 
         frames.append(_make_grid([_obs_to_hwc(o) for o in obs_list]))
@@ -79,7 +106,10 @@ class PolicyGifCallback(BaseCallback):
         steps_per_gif: int,
         fps: int,
         out_dir: Path,
-        make_eval_env: Callable[[int, int], object],
+        seed: int,
+        headless: bool,
+        frame_stack: int,
+        port_base: int,
         verbose: int = 0,
     ):
         super().__init__(verbose=verbose)
@@ -87,7 +117,10 @@ class PolicyGifCallback(BaseCallback):
         self.steps_per_gif = max(1, int(steps_per_gif))
         self.fps = max(1, int(fps))
         self.out_dir = out_dir
-        self.make_eval_env = make_eval_env
+        self.seed = int(seed)
+        self.headless = bool(headless)
+        self.frame_stack = max(1, int(frame_stack))
+        self.port_base = int(port_base)
         self._last_export_at = 0
         self._export_idx = 0
         self._proc: mp.Process | None = None
@@ -96,20 +129,25 @@ class PolicyGifCallback(BaseCallback):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         # Keep only one GIF path (overwrite).
         gif_path = self.out_dir / "latest_policy.gif"
+        model_path = self.out_dir / "latest_policy_model.zip"
+        self.model.save(str(model_path))
 
-        # Use fork so child can use current model object without pickling/reloading.
-        ctx = mp.get_context("fork")
+        # Use spawn for CUDA safety.
+        ctx = mp.get_context("spawn")
         proc = ctx.Process(
             target=_generate_policy_gif_worker,
             args=(
-                self.model,
-                self.make_eval_env,
+                str(model_path),
                 self.steps_per_gif,
                 self.fps,
                 str(gif_path),
                 self._export_idx,
                 self.num_timesteps,
                 self.verbose,
+                self.seed,
+                self.headless,
+                self.frame_stack,
+                self.port_base,
             ),
             daemon=True,
         )

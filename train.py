@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 from collections import deque
 from pathlib import Path
 from typing import Callable
@@ -33,6 +34,15 @@ from wandb.integration.sb3 import WandbCallback
 
 import suika_env  # noqa: F401  # Registers "SuikaEnv-v0"
 from policy_gif_callback import PolicyGifCallback
+
+
+def restore_terminal_cursor():
+    # Ensure cursor/TTY state is restored after rich/tqdm interruption.
+    for cmd in (["stty", "sane"], ["tput", "cnorm"]):
+        try:
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        except Exception:
+            pass
 
 
 class SuikaObsWrapper(gym.ObservationWrapper):
@@ -297,30 +307,6 @@ def make_env(
     return _init
 
 
-def make_eval_env_for_gif(
-    rank: int,
-    export_idx: int,
-    headless: bool,
-    frame_stack: int,
-    port_base: int,
-):
-    # Keep GIF-eval ports disjoint from train env ports.
-    port = port_base + 1000 + rank
-    env = gym.make(
-        "SuikaEnv-v0",
-        headless=headless,
-        delay_before_img_capture=0.0,
-        port=port,
-        mute_sound=True,
-        wait_for_ready_on_step=True,
-        ready_poll_interval=0.02,
-        ready_timeout=2.0,
-    )
-    env = SuikaObsWrapper(env)
-    env = SuikaFrameStackWrapper(env, k=frame_stack)
-    return env
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
@@ -505,13 +491,10 @@ def main():
                     steps_per_gif=args.gif_eval_steps,
                     fps=args.gif_fps,
                     out_dir=args.gif_dir,
-                    make_eval_env=lambda rank, export_idx: make_eval_env_for_gif(
-                        rank=rank,
-                        export_idx=export_idx,
-                        headless=args.headless,
-                        frame_stack=args.frame_stack,
-                        port_base=args.port_base,
-                    ),
+                    seed=args.seed,
+                    headless=args.headless,
+                    frame_stack=args.frame_stack,
+                    port_base=args.port_base,
                     verbose=1,
                 )
             )
@@ -536,9 +519,11 @@ def main():
             interrupted_path = args.save_path.parent / f"{args.save_path.name}_interrupted"
             model.save(str(interrupted_path))
             print(f"Saved interrupted model to: {interrupted_path}.zip")
+        restore_terminal_cursor()
     finally:
         vec_env.close()
         run.finish()
+        restore_terminal_cursor()
     if not interrupted:
         print(f"Saved model to: {args.save_path}.zip")
 
