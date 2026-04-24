@@ -41,30 +41,30 @@ def _generate_policy_gif_worker(
     frame_stack: int,
     port_base: int,
 ):
-    # Import wrappers lazily to avoid import cycle at module import time.
-    from train import SuikaFrameStackWrapper, SuikaObsWrapper
-
-    model = PPO.load(model_path, device="cpu")
-
-    def make_eval_env(rank: int):
-        port = port_base + 1000 + rank
-        env = gym.make(
-            "SuikaEnv-v0",
-            headless=headless,
-            delay_before_img_capture=0.0,
-            port=port,
-            mute_sound=True,
-            wait_for_ready_on_step=True,
-            ready_poll_interval=0.02,
-            ready_timeout=2.0,
-        )
-        env = SuikaObsWrapper(env)
-        env = SuikaFrameStackWrapper(env, k=frame_stack)
-        return env
-
-    envs = [make_eval_env(i) for i in range(4)]
-    frames = []
     try:
+        # Import wrappers lazily to avoid import cycle at module import time.
+        from train import SuikaFrameStackWrapper, SuikaObsWrapper
+
+        model = PPO.load(model_path, device="cpu")
+
+        def make_eval_env(rank: int):
+            port = port_base + 1000 + rank
+            env = gym.make(
+                "SuikaEnv-v0",
+                headless=headless,
+                delay_before_img_capture=0.0,
+                port=port,
+                mute_sound=True,
+                wait_for_ready_on_step=True,
+                ready_poll_interval=0.02,
+                ready_timeout=2.0,
+            )
+            env = SuikaObsWrapper(env)
+            env = SuikaFrameStackWrapper(env, k=frame_stack)
+            return env
+
+        envs = [make_eval_env(i) for i in range(4)]
+        frames = []
         obs_list = []
         for i, env in enumerate(envs):
             obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
@@ -89,7 +89,13 @@ def _generate_policy_gif_worker(
         imageio.mimsave(gif_path, frames, fps=fps)
         if verbose > 0:
             print(f"[PolicyGifCallback] Saved {gif_path} at step={num_timesteps}")
+    except Exception as exc:
+        err_path = str(Path(gif_path).with_suffix(".error.txt"))
+        with open(err_path, "w", encoding="utf-8") as f:
+            f.write(f"GIF worker failed at step={num_timesteps}\n{type(exc).__name__}: {exc}\n")
+        raise
     finally:
+        envs = locals().get("envs", [])
         for env in envs:
             try:
                 env.close()
@@ -149,7 +155,7 @@ class PolicyGifCallback(BaseCallback):
                 self.frame_stack,
                 self.port_base,
             ),
-            daemon=True,
+            daemon=False,
         )
         proc.start()
         self._proc = proc
@@ -183,5 +189,7 @@ class PolicyGifCallback(BaseCallback):
 
     def _on_training_end(self) -> None:
         if self._proc is not None and self._proc.is_alive():
-            # Do not block for long at training end.
-            self._proc.join(timeout=1.0)
+            # Give GIF worker enough time to finish writing output.
+            self._proc.join(timeout=300.0)
+            if self._proc.is_alive():
+                self._proc.terminate()
