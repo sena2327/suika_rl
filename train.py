@@ -7,6 +7,7 @@ Requirements:
 Run:
   uv run python train.py --total-timesteps 200000 --n-envs 1
   uv run python train.py --device cuda --gpu-id 0
+  uv run python train.py --save-every-steps 10000
 """
 
 from __future__ import annotations
@@ -119,6 +120,12 @@ def parse_args():
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
+    p.add_argument(
+        "--save-every-steps",
+        type=int,
+        default=20_000,
+        help="Save checkpoint every N env steps (<=0 disables periodic checkpointing).",
+    )
     p.add_argument("--device", type=str, default="auto", help="SB3 device, e.g. auto|cpu|cuda")
     p.add_argument(
         "--gpu-id",
@@ -169,6 +176,7 @@ def main():
             "max_grad_norm": 0.5,
             "device": args.device,
             "gpu_id": args.gpu_id,
+            "save_every_steps": args.save_every_steps,
         },
         sync_tensorboard=True,
         monitor_gym=False,
@@ -197,10 +205,11 @@ def main():
             device=args.device,
         )
 
+        save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
         callback = WandbCallback(
             gradient_save_freq=0,
             model_save_path=str(args.save_path.parent / "wandb_checkpoints"),
-            model_save_freq=20_000,
+            model_save_freq=save_freq,
             verbose=2,
         )
         model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=callback)
