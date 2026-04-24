@@ -1,5 +1,6 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException, WebDriverException
 import time
 import gymnasium
 import ipdb
@@ -38,12 +39,19 @@ class SuikaBrowserEnv(gymnasium.Env):
             suika_game_dir = os.path.join(script_dir, 'suika-game')
             self.server = subprocess.Popen(["python", "-m", "http.server", str(port)], cwd=suika_game_dir, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 
-        opts = webdriver.ChromeOptions()
-        opts.add_argument("--width=1024")
-        opts.add_argument("--height=768")
+        self._chrome_options = webdriver.ChromeOptions()
+        self._chrome_options.add_argument("--width=1024")
+        self._chrome_options.add_argument("--height=768")
+        # Stability flags for headless/server environments.
+        self._chrome_options.add_argument("--disable-dev-shm-usage")
+        self._chrome_options.add_argument("--no-sandbox")
+        self._chrome_options.add_argument("--disable-gpu")
+        self._chrome_options.add_argument("--disable-background-timer-throttling")
+        self._chrome_options.add_argument("--disable-renderer-backgrounding")
+        self._chrome_options.add_argument("--disable-backgrounding-occluded-windows")
         self.headless = headless
         if headless:
-            opts.add_argument("--headless=new")
+            self._chrome_options.add_argument("--headless=new")
         self.delay_before_img_capture = delay_before_img_capture
         self.mute_sound = mute_sound
         self.wait_for_ready_on_step = wait_for_ready_on_step
@@ -51,13 +59,27 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.ready_timeout = ready_timeout
         self.img_width = 128
         self.img_height = 128
-        self.driver = webdriver.Chrome(options=opts)
+        self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
             'score': gymnasium.spaces.Box(low=0, high=1000000, shape=(1,), dtype="float32"),
         }
         self.observation_space = gymnasium.spaces.Dict(_obs_dict)
         self.action_space = gymnasium.spaces.Box(low=0, high=1, shape=(1,))
+
+    def _create_driver(self):
+        driver = webdriver.Chrome(options=self._chrome_options)
+        # Keep selenium command timeouts shorter so worker failures recover quickly.
+        driver.set_script_timeout(20)
+        return driver
+
+    def _restart_driver(self):
+        if self.driver is not None:
+            try:
+                self.driver.quit()
+            except Exception:
+                pass
+        self.driver = self._create_driver()
 
     def reset(self,seed=None, options=None):
         self._reload()
@@ -117,30 +139,38 @@ class SuikaBrowserEnv(gymnasium.Env):
         driver = self.driver
         action = action[0]
         info = {}
-        # action is a float from 0 to 1. need to convert to int from 0 to 640 and then string.
-        action = str(int(action * 640))
-        # clear the input box with id "fruit-position"
-        driver.find_element(By.ID, 'fruit-position').clear()
-        # enter in the number into the input box with id "fruit-position"
-        driver.find_element(By.ID, 'fruit-position').send_keys(action)
-        # click the button with id "drop-fruit-button"
-        driver.find_element(By.ID, 'drop-fruit-button').click()
-        if self.wait_for_ready_on_step:
-            self._wait_until_step_stable()
-        elif self.delay_before_img_capture > 0:
-            time.sleep(self.delay_before_img_capture)
+        try:
+            # action is a float from 0 to 1. need to convert to int from 0 to 640 and then string.
+            action = str(int(action * 640))
+            # clear the input box with id "fruit-position"
+            driver.find_element(By.ID, 'fruit-position').clear()
+            # enter in the number into the input box with id "fruit-position"
+            driver.find_element(By.ID, 'fruit-position').send_keys(action)
+            # click the button with id "drop-fruit-button"
+            driver.find_element(By.ID, 'drop-fruit-button').click()
+            if self.wait_for_ready_on_step:
+                self._wait_until_step_stable()
+            elif self.delay_before_img_capture > 0:
+                time.sleep(self.delay_before_img_capture)
 
-        obs, status = self._get_obs_and_status()
-        reward = 0
-        # check if game is over.
-        terminal = status == 3
-        truncated = False 
-        score = obs['score'].item()
-        info['score'] = score
-        reward += score - self.score
-        self.score = score
+            obs, status = self._get_obs_and_status()
+            reward = 0
+            # check if game is over.
+            terminal = status == 3
+            truncated = False 
+            score = obs['score'].item()
+            info['score'] = score
+            reward += score - self.score
+            self.score = score
 
-        return obs, reward, terminal, truncated, info
+            return obs, reward, terminal, truncated, info
+        except (TimeoutException, WebDriverException) as exc:
+            # Recover from browser crashes/timeouts instead of killing the worker process.
+            info["browser_error"] = str(exc)
+            info["recovered"] = True
+            self._restart_driver()
+            obs, _ = self.reset()
+            return obs, -1.0, True, True, info
 
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2. We poll until it changes or timeout.

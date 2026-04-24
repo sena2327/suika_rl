@@ -89,16 +89,16 @@ class SuikaCombinedExtractor(BaseFeaturesExtractor):
         return th.cat([img_feat, score_feat], dim=1)
 
 
-def make_env(rank: int, seed: int, headless: bool, delay: float) -> Callable[[], gym.Env]:
+def make_env(rank: int, seed: int, headless: bool, delay: float, port_base: int) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env = gym.make(
             "SuikaEnv-v0",
             headless=headless,
             delay_before_img_capture=0.0,
-            port=8923,
+            port=port_base + rank,
             mute_sound=True,
             wait_for_ready_on_step=True,
-            ready_poll_interval=0.005,
+            ready_poll_interval=0.02,
             ready_timeout=2.0,
         )
         env = SuikaObsWrapper(env)
@@ -111,8 +111,9 @@ def make_env(rank: int, seed: int, headless: bool, delay: float) -> Callable[[],
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
-    p.add_argument("--n-envs", type=int, default=1)
+    p.add_argument("--n-envs", type=int, default=2)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
@@ -147,7 +148,7 @@ def main():
     tb_dir.mkdir(parents=True, exist_ok=True)
 
     env_fns = [
-        make_env(i, args.seed, args.headless, args.delay_before_img_capture)
+        make_env(i, args.seed, args.headless, args.delay_before_img_capture, args.port_base)
         for i in range(args.n_envs)
     ]
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
