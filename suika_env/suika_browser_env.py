@@ -11,8 +11,14 @@ import subprocess
 import socket
 import os
 
+# Pillow 10+ removed Image.ANTIALIAS.
+if hasattr(Image, "Resampling"):
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+else:
+    RESAMPLE_LANCZOS = Image.ANTIALIAS
+
 class SuikaBrowserEnv(gymnasium.Env):
-    def __init__(self, headless=True, port=8923, delay_before_img_capture=0.5) -> None:
+    def __init__(self, headless=True, port=8923, delay_before_img_capture=0.5, mute_sound=False) -> None:
         self.game_url = f"http://localhost:{port}/"
         # Check if port is already in use
         self.server = None
@@ -30,6 +36,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         if headless:
             opts.add_argument("--headless=new")
         self.delay_before_img_capture = delay_before_img_capture
+        self.mute_sound = mute_sound
         self.img_width = 128
         self.img_height = 128
         self.driver = webdriver.Chrome(options=opts)
@@ -50,9 +57,28 @@ class SuikaBrowserEnv(gymnasium.Env):
     def _reload(self):
         # open the game.
         self.driver.get(self.game_url)
+        if self.mute_sound:
+            self._mute_audio()
         # click start game button with id "start-game-button"
         self.driver.find_element(By.ID, 'start-game-button').click()
         time.sleep(1)
+
+    def _mute_audio(self):
+        # Disable audio playback in browser for training speed/stability.
+        self.driver.execute_script("""
+            (() => {
+                const mute = (a) => {
+                    if (!a) return;
+                    a.muted = true;
+                    a.volume = 0.0;
+                    a.play = () => Promise.resolve();
+                };
+                if (window.Game && window.Game.sounds) {
+                    Object.values(window.Game.sounds).forEach(mute);
+                }
+                document.querySelectorAll("audio").forEach(mute);
+            })();
+        """)
     
     def _get_obs_and_status(self):
         img = self._capture_canvas()
@@ -64,13 +90,13 @@ class SuikaBrowserEnv(gymnasium.Env):
         # screenshots the game canvas with id "game-canvas" and stores it in a numpy array
         canvas = self.driver.find_element(By.ID, 'game-canvas')
         image_string = canvas.screenshot_as_png
-        img = Image.open(io.BytesIO(image_string))
+        img = Image.open(io.BytesIO(image_string)).convert("RGBA")
         # first crop out right hand side and lower bar.
         img = img.crop((0,0,520,img.height))
         arr = np.asarray(img)
         # imageio.imwrite('cropped.png', arr)
         # import ipdb; ipdb.set_trace()
-        imgResized = img.resize((self.img_width,self.img_height), Image.ANTIALIAS) 
+        imgResized = img.resize((self.img_width,self.img_height), RESAMPLE_LANCZOS)
         arr = np.asarray(imgResized)
         return arr
 

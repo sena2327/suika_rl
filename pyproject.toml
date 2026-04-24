@@ -1,0 +1,18 @@
+[project]
+name = "suika-rl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=0.29,<1.1",
+    "imageio>=2.37.3",
+    "ipdb>=0.13.13",
+    "rich>=15.0.0",
+    "selenium>=4.43.0",
+    "stable-baselines3>=2.3,<3",
+    "tensorboard>=2.20.0",
+    "torch>=2.11.0",
+    "tqdm>=4.67.3",
+    "wandb>=0.26.1",
+]
