@@ -18,7 +18,16 @@ else:
     RESAMPLE_LANCZOS = Image.ANTIALIAS
 
 class SuikaBrowserEnv(gymnasium.Env):
-    def __init__(self, headless=True, port=8923, delay_before_img_capture=0.5, mute_sound=False) -> None:
+    def __init__(
+        self,
+        headless=True,
+        port=8923,
+        delay_before_img_capture=0.5,
+        mute_sound=False,
+        wait_for_ready_on_step=False,
+        ready_poll_interval=0.01,
+        ready_timeout=2.0,
+    ) -> None:
         self.game_url = f"http://localhost:{port}/"
         # Check if port is already in use
         self.server = None
@@ -37,6 +46,9 @@ class SuikaBrowserEnv(gymnasium.Env):
             opts.add_argument("--headless=new")
         self.delay_before_img_capture = delay_before_img_capture
         self.mute_sound = mute_sound
+        self.wait_for_ready_on_step = wait_for_ready_on_step
+        self.ready_poll_interval = ready_poll_interval
+        self.ready_timeout = ready_timeout
         self.img_width = 128
         self.img_height = 128
         self.driver = webdriver.Chrome(options=opts)
@@ -113,7 +125,10 @@ class SuikaBrowserEnv(gymnasium.Env):
         driver.find_element(By.ID, 'fruit-position').send_keys(action)
         # click the button with id "drop-fruit-button"
         driver.find_element(By.ID, 'drop-fruit-button').click()
-        time.sleep(self.delay_before_img_capture)
+        if self.wait_for_ready_on_step:
+            self._wait_until_step_stable()
+        elif self.delay_before_img_capture > 0:
+            time.sleep(self.delay_before_img_capture)
 
         obs, status = self._get_obs_and_status()
         reward = 0
@@ -126,6 +141,17 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.score = score
 
         return obs, reward, terminal, truncated, info
+
+    def _wait_until_step_stable(self):
+        # In the JS game, DROP state is 2. We poll until it changes or timeout.
+        start = time.time()
+        while True:
+            state = self.driver.execute_script("return window.Game.stateIndex;")
+            if state != 2:
+                return
+            if (time.time() - start) >= self.ready_timeout:
+                return
+            time.sleep(self.ready_poll_interval)
 
 
     def is_port_in_use(self, port):

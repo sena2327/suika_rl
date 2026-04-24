@@ -93,9 +93,12 @@ def make_env(rank: int, seed: int, headless: bool, delay: float) -> Callable[[],
         env = gym.make(
             "SuikaEnv-v0",
             headless=headless,
-            delay_before_img_capture=delay,
+            delay_before_img_capture=0.0,
             port=8923,
             mute_sound=True,
+            wait_for_ready_on_step=True,
+            ready_poll_interval=0.005,
+            ready_timeout=2.0,
         )
         env = SuikaObsWrapper(env)
         env.reset(seed=seed + rank)
