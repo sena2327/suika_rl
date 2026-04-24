@@ -24,6 +24,7 @@ import torch.nn as nn
 import wandb
 from gymnasium import spaces
 from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMonitor
 from wandb.integration.sb3 import WandbCallback
@@ -89,6 +90,36 @@ class SuikaCombinedExtractor(BaseFeaturesExtractor):
         return th.cat([img_feat, score_feat], dim=1)
 
 
+class BrowserRestartCallback(BaseCallback):
+    """Queue browser restarts and apply them only on episode boundaries."""
+
+    def __init__(self, every_steps: int = 3000, verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self.every_steps = max(1, int(every_steps))
+        self._last_restart_at = 0
+        self._restart_pending = False
+
+    def _on_step(self) -> bool:
+        if (self.num_timesteps - self._last_restart_at) >= self.every_steps:
+            self._restart_pending = True
+
+        if self._restart_pending:
+            dones = self.locals.get("dones", None)
+            if dones is not None:
+                done_indices = np.nonzero(np.asarray(dones))[0].tolist()
+                if done_indices:
+                    if self.verbose > 0:
+                        print(
+                            "[BrowserRestartCallback] Restarting browsers on episode boundary "
+                            f"at step={self.num_timesteps}, envs={done_indices}"
+                        )
+                    self.training_env.env_method("restart_browser", indices=done_indices)
+                    self.training_env.env_method("reset", indices=done_indices)
+                    self._last_restart_at = self.num_timesteps
+                    self._restart_pending = False
+        return True
+
+
 def make_env(rank: int, seed: int, headless: bool, delay: float, port_base: int) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env = gym.make(
@@ -126,6 +157,12 @@ def parse_args():
         type=int,
         default=20_000,
         help="Save checkpoint every N env steps (<=0 disables periodic checkpointing).",
+    )
+    p.add_argument(
+        "--restart-browser-every-steps",
+        type=int,
+        default=3_000,
+        help="Restart all browser envs every N global train timesteps (<=0 disables).",
     )
     p.add_argument("--device", type=str, default="auto", help="SB3 device, e.g. auto|cpu|cuda")
     p.add_argument(
@@ -178,6 +215,7 @@ def main():
             "device": args.device,
             "gpu_id": args.gpu_id,
             "save_every_steps": args.save_every_steps,
+            "restart_browser_every_steps": args.restart_browser_every_steps,
         },
         sync_tensorboard=True,
         monitor_gym=False,
@@ -207,13 +245,25 @@ def main():
         )
 
         save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
-        callback = WandbCallback(
+        wandb_callback = WandbCallback(
             gradient_save_freq=0,
             model_save_path=str(args.save_path.parent / "wandb_checkpoints"),
             model_save_freq=save_freq,
             verbose=2,
         )
-        model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=callback)
+        callbacks = [wandb_callback]
+        if args.restart_browser_every_steps > 0:
+            callbacks.append(
+                BrowserRestartCallback(
+                    every_steps=args.restart_browser_every_steps,
+                    verbose=1,
+                )
+            )
+        model.learn(
+            total_timesteps=args.total_timesteps,
+            progress_bar=True,
+            callback=CallbackList(callbacks),
+        )
         model.save(str(args.save_path))
     except KeyboardInterrupt:
         interrupted = True

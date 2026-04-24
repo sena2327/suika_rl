@@ -1,6 +1,7 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from urllib3.exceptions import ReadTimeoutError
 import time
 import gymnasium
 import ipdb
@@ -80,6 +81,10 @@ class SuikaBrowserEnv(gymnasium.Env):
             except Exception:
                 pass
         self.driver = self._create_driver()
+
+    def restart_browser(self):
+        """Public hook for vec_env.env_method()."""
+        self._restart_driver()
 
     def reset(self,seed=None, options=None):
         self._reload()
@@ -164,7 +169,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             self.score = score
 
             return obs, reward, terminal, truncated, info
-        except (TimeoutException, WebDriverException) as exc:
+        except (TimeoutException, WebDriverException, ReadTimeoutError, TimeoutError, OSError) as exc:
             # Recover from browser crashes/timeouts instead of killing the worker process.
             info["browser_error"] = str(exc)
             info["recovered"] = True
