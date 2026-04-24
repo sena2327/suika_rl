@@ -8,6 +8,7 @@ Run:
   uv run python train.py --total-timesteps 200000 --n-envs 1
   uv run python train.py --device cuda --gpu-id 0
   uv run python train.py --save-every-steps 10000
+  uv run python train.py --n-envs 16 --rollout-steps-total 1024
 """
 
 from __future__ import annotations
@@ -97,26 +98,38 @@ class BrowserRestartCallback(BaseCallback):
         super().__init__(verbose=verbose)
         self.every_steps = max(1, int(every_steps))
         self._last_restart_at = 0
-        self._restart_pending = False
+        self._pending_env_indices = set()
 
     def _on_step(self) -> bool:
-        if (self.num_timesteps - self._last_restart_at) >= self.every_steps:
-            self._restart_pending = True
+        if (self.num_timesteps - self._last_restart_at) >= self.every_steps and not self._pending_env_indices:
+            self._pending_env_indices = set(range(self.training_env.num_envs))
+            if self.verbose > 0:
+                print(
+                    "[BrowserRestartCallback] Restart queued for all envs "
+                    f"at step={self.num_timesteps}"
+                )
 
-        if self._restart_pending:
+        if self._pending_env_indices:
             dones = self.locals.get("dones", None)
             if dones is not None:
-                done_indices = np.nonzero(np.asarray(dones))[0].tolist()
-                if done_indices:
+                done_indices = set(np.nonzero(np.asarray(dones))[0].tolist())
+                ready_to_restart = sorted(done_indices.intersection(self._pending_env_indices))
+                if ready_to_restart:
                     if self.verbose > 0:
                         print(
                             "[BrowserRestartCallback] Restarting browsers on episode boundary "
-                            f"at step={self.num_timesteps}, envs={done_indices}"
+                            f"at step={self.num_timesteps}, envs={ready_to_restart}"
                         )
-                    self.training_env.env_method("restart_browser", indices=done_indices)
-                    self.training_env.env_method("reset", indices=done_indices)
-                    self._last_restart_at = self.num_timesteps
-                    self._restart_pending = False
+                    self.training_env.env_method("restart_browser", indices=ready_to_restart)
+                    self.training_env.env_method("reset", indices=ready_to_restart)
+                    self._pending_env_indices.difference_update(ready_to_restart)
+                    if not self._pending_env_indices:
+                        self._last_restart_at = self.num_timesteps
+                        if self.verbose > 0:
+                            print(
+                                "[BrowserRestartCallback] Restart cycle completed "
+                                f"at step={self.num_timesteps}"
+                            )
         return True
 
 
@@ -143,6 +156,21 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
     p.add_argument("--n-envs", type=int, default=2)
+    p.add_argument(
+        "--n-steps",
+        type=int,
+        default=128,
+        help="PPO rollout length per env before each update (smaller => more frequent logs).",
+    )
+    p.add_argument(
+        "--rollout-steps-total",
+        type=int,
+        default=0,
+        help=(
+            "Target total rollout steps per PPO update. "
+            "If > 0, n_steps is set to max(1, rollout_steps_total // n_envs)."
+        ),
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
@@ -180,6 +208,16 @@ def main():
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    effective_n_steps = args.n_steps
+    if args.rollout_steps_total > 0:
+        effective_n_steps = max(1, args.rollout_steps_total // args.n_envs)
+    effective_rollout_total = effective_n_steps * args.n_envs
+    print(
+        f"[train] n_envs={args.n_envs}, n_steps={effective_n_steps}, "
+        f"rollout_total={effective_rollout_total}"
+    )
+
     run_name = args.wandb_run_name or f"ppo-suika-seed{args.seed}"
     tb_dir = Path("runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -204,7 +242,8 @@ def main():
             "delay_before_img_capture": args.delay_before_img_capture,
             "headless": args.headless,
             "learning_rate": 3e-4,
-            "n_steps": 1024,
+            "n_steps": effective_n_steps,
+            "rollout_steps_total": effective_rollout_total,
             "batch_size": 256,
             "gamma": 0.99,
             "gae_lambda": 0.95,
@@ -230,7 +269,7 @@ def main():
             vec_env,
             policy_kwargs=policy_kwargs,
             learning_rate=3e-4,
-            n_steps=1024,
+            n_steps=effective_n_steps,
             batch_size=256,
             gamma=0.99,
             gae_lambda=0.95,
@@ -262,6 +301,7 @@ def main():
         model.learn(
             total_timesteps=args.total_timesteps,
             progress_bar=True,
+            log_interval=1,
             callback=CallbackList(callbacks),
         )
         model.save(str(args.save_path))
