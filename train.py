@@ -257,7 +257,6 @@ def make_env(
         )
         env = SuikaObsWrapper(env)
         env = SuikaFrameStackWrapper(env, k=frame_stack)
-        env.reset(seed=seed + rank)
         return env
 
     return _init

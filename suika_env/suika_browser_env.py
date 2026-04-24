@@ -124,7 +124,19 @@ class SuikaBrowserEnv(gymnasium.Env):
     
     def _get_obs_and_status(self):
         img = self._capture_canvas()
-        status, score, fruit_type, fruit_x = self.driver.execute_script("""
+        status, score, fruit_type, fruit_x = self._query_game_snapshot()
+        return dict(
+            image=img,
+            current_fruit_type=np.array([fruit_type], dtype=np.float32),
+            current_fruit_x=np.array([fruit_x], dtype=np.float32),
+        ), status, float(score)
+
+    def _query_game_snapshot(self):
+        # Game object can be transiently unavailable right after reload/start.
+        # Retry briefly and fall back to safe defaults instead of crashing workers.
+        deadline = time.time() + 2.0
+        while True:
+            out = self.driver.execute_script("""
             (() => {
                 const game = window.Game || {};
                 const status = Number.isFinite(game.stateIndex) ? game.stateIndex : 0;
@@ -143,11 +155,11 @@ class SuikaBrowserEnv(gymnasium.Env):
                 return [status, score, fruitType, x];
             })();
         """)
-        return dict(
-            image=img,
-            current_fruit_type=np.array([fruit_type], dtype=np.float32),
-            current_fruit_x=np.array([fruit_x], dtype=np.float32),
-        ), status, float(score)
+            if isinstance(out, (list, tuple)) and len(out) == 4:
+                return out
+            if time.time() >= deadline:
+                return [0, float(self.score), 0, 0.5]
+            time.sleep(0.02)
 
     def capture_canvas_raw_rgba(self):
         """Debug helper: return cropped canvas before resize."""
