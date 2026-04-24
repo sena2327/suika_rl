@@ -22,12 +22,6 @@ def _obs_to_hwc(obs_dict):
     return np.transpose(latest, (1, 2, 0))
 
 
-def _make_grid(images):
-    top = np.concatenate(images[:2], axis=1)
-    bottom = np.concatenate(images[2:], axis=1)
-    return np.concatenate([top, bottom], axis=0)
-
-
 def _generate_policy_gif_worker(
     model_path: str,
     steps_per_gif: int,
@@ -63,14 +57,14 @@ def _generate_policy_gif_worker(
             env = SuikaFrameStackWrapper(env, k=frame_stack)
             return env
 
-        envs = [make_eval_env(i) for i in range(4)]
+        envs = [make_eval_env(0)]
         frames = []
         obs_list = []
         for i, env in enumerate(envs):
             obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
             obs_list.append(obs)
 
-        frames.append(_make_grid([_obs_to_hwc(o) for o in obs_list]))
+        frames.append(_obs_to_hwc(obs_list[0]))
 
         for _ in range(steps_per_gif):
             next_obs_list = []
@@ -84,7 +78,7 @@ def _generate_policy_gif_worker(
                     obs2, _ = env.reset()
                 next_obs_list.append(obs2)
             obs_list = next_obs_list
-            frames.append(_make_grid([_obs_to_hwc(o) for o in obs_list]))
+            frames.append(_obs_to_hwc(obs_list[0]))
 
         imageio.mimsave(gif_path, frames, fps=fps)
         if verbose > 0:
