@@ -215,7 +215,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             info["recovered"] = True
             self._restart_driver()
             obs, _ = self.reset()
-            return obs, -1.0, True, True, info
+            return obs, 0.0, True, True, info
 
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2. We poll until it changes or timeout.

@@ -32,6 +32,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from wandb.integration.sb3 import WandbCallback
 
 import suika_env  # noqa: F401  # Registers "SuikaEnv-v0"
+from policy_gif_callback import PolicyGifCallback
 
 
 class SuikaObsWrapper(gym.ObservationWrapper):
@@ -236,6 +237,40 @@ class FinalScoreLoggingCallback(BaseCallback):
         return True
 
 
+class ActionStatsLoggingCallback(BaseCallback):
+    """Log action-x mean/variance during rollout collection."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+
+    def _on_step(self) -> bool:
+        actions = self.locals.get("actions", None)
+        if actions is None:
+            return True
+
+        arr = np.asarray(actions)
+        if arr.size == 0:
+            return True
+        if arr.ndim == 1:
+            x = arr.astype(np.float32)
+        else:
+            # Continuous 1D action space: first column is x in [0, 1].
+            x = arr[:, 0].astype(np.float32)
+
+        x_mean = float(np.mean(x))
+        x_var = float(np.var(x))
+        self.logger.record("rollout/action_x_mean", x_mean)
+        self.logger.record("rollout/action_x_var", x_var)
+        wandb.log(
+            {
+                "rollout/action_x_mean": x_mean,
+                "rollout/action_x_var": x_var,
+            },
+            step=self.num_timesteps,
+        )
+        return True
+
+
 def make_env(
     rank: int,
     seed: int,
@@ -260,6 +295,30 @@ def make_env(
         return env
 
     return _init
+
+
+def make_eval_env_for_gif(
+    rank: int,
+    export_idx: int,
+    headless: bool,
+    frame_stack: int,
+    port_base: int,
+):
+    # Keep GIF-eval ports disjoint from train env ports.
+    port = port_base + 1000 + rank
+    env = gym.make(
+        "SuikaEnv-v0",
+        headless=headless,
+        delay_before_img_capture=0.0,
+        port=port,
+        mute_sound=True,
+        wait_for_ready_on_step=True,
+        ready_poll_interval=0.02,
+        ready_timeout=2.0,
+    )
+    env = SuikaObsWrapper(env)
+    env = SuikaFrameStackWrapper(env, k=frame_stack)
+    return env
 
 
 def parse_args():
@@ -302,6 +361,30 @@ def parse_args():
         type=int,
         default=3_000,
         help="Restart all browser envs every N global train timesteps (<=0 disables).",
+    )
+    p.add_argument(
+        "--gif-eval-every-steps",
+        type=int,
+        default=10_000,
+        help="Export policy gameplay GIF every N timesteps (<=0 disables).",
+    )
+    p.add_argument(
+        "--gif-eval-steps",
+        type=int,
+        default=120,
+        help="Number of policy steps recorded into each GIF.",
+    )
+    p.add_argument(
+        "--gif-fps",
+        type=int,
+        default=20,
+        help="GIF playback FPS (higher is faster).",
+    )
+    p.add_argument(
+        "--gif-dir",
+        type=Path,
+        default=Path("gifs"),
+        help="Directory for periodic policy GIFs.",
     )
     p.add_argument("--device", type=str, default="auto", help="SB3 device, e.g. auto|cpu|cuda")
     p.add_argument(
@@ -374,6 +457,9 @@ def main():
             "gpu_id": args.gpu_id,
             "save_every_steps": args.save_every_steps,
             "restart_browser_every_steps": args.restart_browser_every_steps,
+            "gif_eval_every_steps": args.gif_eval_every_steps,
+            "gif_eval_steps": args.gif_eval_steps,
+            "gif_fps": args.gif_fps,
         },
         sync_tensorboard=True,
         monitor_gym=False,
@@ -411,6 +497,24 @@ def main():
         )
         callbacks = [wandb_callback]
         callbacks.append(FinalScoreLoggingCallback(verbose=0))
+        callbacks.append(ActionStatsLoggingCallback(verbose=0))
+        if args.gif_eval_every_steps > 0:
+            callbacks.append(
+                PolicyGifCallback(
+                    every_steps=args.gif_eval_every_steps,
+                    steps_per_gif=args.gif_eval_steps,
+                    fps=args.gif_fps,
+                    out_dir=args.gif_dir,
+                    make_eval_env=lambda rank, export_idx: make_eval_env_for_gif(
+                        rank=rank,
+                        export_idx=export_idx,
+                        headless=args.headless,
+                        frame_stack=args.frame_stack,
+                        port_base=args.port_base,
+                    ),
+                    verbose=1,
+                )
+            )
         if args.restart_browser_every_steps > 0:
             callbacks.append(
                 BrowserRestartCallback(
