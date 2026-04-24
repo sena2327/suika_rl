@@ -172,6 +172,7 @@ def main():
         save_code=True,
     )
 
+    interrupted = False
     try:
         policy_kwargs = dict(features_extractor_class=SuikaCombinedExtractor)
         model = PPO(
@@ -201,10 +202,18 @@ def main():
         )
         model.learn(total_timesteps=args.total_timesteps, progress_bar=True, callback=callback)
         model.save(str(args.save_path))
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nKeyboardInterrupt received. Finishing cleanup...")
+        if "model" in locals():
+            interrupted_path = args.save_path.parent / f"{args.save_path.name}_interrupted"
+            model.save(str(interrupted_path))
+            print(f"Saved interrupted model to: {interrupted_path}.zip")
     finally:
         vec_env.close()
         run.finish()
-    print(f"Saved model to: {args.save_path}.zip")
+    if not interrupted:
+        print(f"Saved model to: {args.save_path}.zip")
 
 
 if __name__ == "__main__":
