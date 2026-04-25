@@ -36,6 +36,7 @@ from train import (
     ActionStatsLoggingCallback,
     BrowserRestartCallback,
     FinalScoreLoggingCallback,
+    PolicyStdLoggingCallback,
     restore_terminal_cursor,
 )
 
@@ -342,7 +343,10 @@ def main():
         model = PPO(
             "MultiInputPolicy",
             vec_env,
-            policy_kwargs=dict(features_extractor_class=SuikaTransformerExtractor),
+            policy_kwargs=dict(
+                features_extractor_class=SuikaTransformerExtractor,
+                share_features_extractor=False,
+            ),
             learning_rate=3e-4,
             n_steps=effective_n_steps,
             batch_size=args.batch_size,
@@ -368,6 +372,7 @@ def main():
         callbacks = [wandb_callback]
         callbacks.append(FinalScoreLoggingCallback(verbose=0))
         callbacks.append(ActionStatsLoggingCallback(verbose=0))
+        callbacks.append(PolicyStdLoggingCallback(verbose=0))
         if args.gif_eval_every_steps > 0:
             callbacks.append(
                 PolicyGifCallback(

@@ -314,6 +314,37 @@ class ActionStatsLoggingCallback(BaseCallback):
         return True
 
 
+class PolicyStdLoggingCallback(BaseCallback):
+    """Log policy std (and log_std) for continuous-action PPO policies."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+
+    def _on_step(self) -> bool:
+        return True
+
+    def _on_rollout_end(self) -> None:
+        policy = self.model.policy
+        if not hasattr(policy, "log_std"):
+            return
+        log_std_t = policy.log_std.detach()
+        std_t = th.exp(log_std_t)
+        log_std_mean = float(log_std_t.mean().cpu().item())
+        std_mean = float(std_t.mean().cpu().item())
+        std_var = float(std_t.var(unbiased=False).cpu().item())
+        self.logger.record("rollout/policy_log_std_mean", log_std_mean)
+        self.logger.record("rollout/policy_std_mean", std_mean)
+        self.logger.record("rollout/policy_std_var", std_var)
+        wandb.log(
+            {
+                "rollout/policy_log_std_mean": log_std_mean,
+                "rollout/policy_std_mean": std_mean,
+                "rollout/policy_std_var": std_var,
+            },
+            step=self.num_timesteps,
+        )
+
+
 def make_env(
     rank: int,
     seed: int,
@@ -512,6 +543,7 @@ def main():
         callbacks = [wandb_callback]
         callbacks.append(FinalScoreLoggingCallback(verbose=0))
         callbacks.append(ActionStatsLoggingCallback(verbose=0))
+        callbacks.append(PolicyStdLoggingCallback(verbose=0))
         if args.gif_eval_every_steps > 0:
             callbacks.append(
                 PolicyGifCallback(

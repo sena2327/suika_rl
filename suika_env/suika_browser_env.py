@@ -326,12 +326,13 @@ class SuikaBrowserEnv(gymnasium.Env):
                 time.sleep(self.delay_before_img_capture)
 
             obs, status, score = self._get_obs_and_status()
-            reward = 0
             # check if game is over.
             terminal = status == 3
             truncated = False 
             info['score'] = score
-            reward += score - self.score
+            reward = score - self.score
+            if terminal:
+                reward = -1000.0
             self.score = score
 
             return obs, reward, terminal, truncated, info

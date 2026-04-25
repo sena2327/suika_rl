@@ -8,6 +8,7 @@ import gymnasium as gym
 import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.utils import obs_as_tensor
 
 import suika_env  # noqa: F401
 
@@ -26,6 +27,21 @@ def _build_model_obs(obs: dict, model: PPO) -> dict:
     return {k: np.expand_dims(obs[k], axis=0) for k in keys}
 
 
+def _get_sigma(model: PPO, model_obs: dict) -> float:
+    with np.errstate(all="ignore"):
+        obs_tensor = obs_as_tensor(model_obs, model.device)
+        dist = model.policy.get_distribution(obs_tensor).distribution
+        if hasattr(dist, "stddev"):
+            std = dist.stddev.detach().cpu().numpy().reshape(-1)
+            if std.size > 0:
+                return float(std[0])
+        if hasattr(model.policy, "log_std"):
+            log_std = model.policy.log_std.detach().cpu().numpy().reshape(-1)
+            if log_std.size > 0:
+                return float(np.exp(log_std[0]))
+    return float("nan")
+
+
 def _generate_policy_gif_worker(
     model_path: str,
     max_steps_per_episode: int,
@@ -40,6 +56,7 @@ def _generate_policy_gif_worker(
 ):
     try:
         model = PPO.load(model_path, device="cpu")
+        action_log_path = str(Path(gif_path).with_name("latest_policy_action.txt"))
 
         def make_eval_env(rank: int):
             port = port_base + 1000 + rank
@@ -58,6 +75,7 @@ def _generate_policy_gif_worker(
         raw_envs = [make_eval_env(0)]
         envs = raw_envs
         frames = []
+        action_logs = []
         obs_list = []
         for i, env in enumerate(envs):
             obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
@@ -72,11 +90,16 @@ def _generate_policy_gif_worker(
             for i, env in enumerate(envs):
                 obs = obs_list[i]
                 model_obs = _build_model_obs(obs, model)
+                sigma = _get_sigma(model, model_obs)
                 action, _ = model.predict(model_obs, deterministic=True)
                 action = np.asarray(action).reshape(-1)
-                obs2, _, terminated, truncated, _ = env.step(action)
+                obs2, reward, terminated, truncated, _ = env.step(action)
                 done = done or bool(terminated or truncated)
                 next_obs_list.append(obs2)
+                x = float(action[0]) if action.size > 0 else float("nan")
+                action_logs.append(
+                    f"{step_count + 1}\t{float(reward):.6f}\t{x:.6f}\t{action.tolist()}\t{sigma:.6f}"
+                )
             obs_list = next_obs_list
             frames.append(_obs_to_hwc(raw_envs[0]))
             step_count += 1
@@ -91,6 +114,10 @@ def _generate_policy_gif_worker(
                 break
 
         imageio.mimsave(gif_path, frames, fps=fps)
+        with open(action_log_path, "w", encoding="utf-8") as f:
+            f.write("step\treward\tx\taction\tsigma\n")
+            for line in action_logs:
+                f.write(line + "\n")
         if verbose > 0:
             print(f"[PolicyGifCallback] Saved {gif_path} at step={num_timesteps}")
     except Exception as exc:
