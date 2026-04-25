@@ -92,7 +92,7 @@ def _generate_policy_gif_worker(
                 obs = obs_list[i]
                 model_obs = _build_model_obs(obs, model)
                 sigma = _get_sigma(model, model_obs)
-                action, _ = model.predict(model_obs, deterministic=True)
+                action, _ = model.predict(model_obs, deterministic=False)
                 action = np.asarray(action).reshape(-1)
                 obs2, reward, terminated, truncated, _ = env.step(action)
                 done = done or bool(terminated or truncated)
