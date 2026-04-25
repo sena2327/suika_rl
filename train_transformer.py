@@ -47,6 +47,24 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
         super().__init__(env)
         self.observation_space = spaces.Dict(
             {
+                "current_fruit_type": spaces.Box(
+                    low=env.observation_space["current_fruit_type"].low.astype(np.float32),
+                    high=env.observation_space["current_fruit_type"].high.astype(np.float32),
+                    shape=env.observation_space["current_fruit_type"].shape,
+                    dtype=np.float32,
+                ),
+                "next_fruit_type": spaces.Box(
+                    low=env.observation_space["next_fruit_type"].low.astype(np.float32),
+                    high=env.observation_space["next_fruit_type"].high.astype(np.float32),
+                    shape=env.observation_space["next_fruit_type"].shape,
+                    dtype=np.float32,
+                ),
+                "current_fruit_x": spaces.Box(
+                    low=env.observation_space["current_fruit_x"].low.astype(np.float32),
+                    high=env.observation_space["current_fruit_x"].high.astype(np.float32),
+                    shape=env.observation_space["current_fruit_x"].shape,
+                    dtype=np.float32,
+                ),
                 "board_fruit_xy": spaces.Box(
                     low=env.observation_space["board_fruit_xy"].low.astype(np.float32),
                     high=env.observation_space["board_fruit_xy"].high.astype(np.float32),
@@ -82,6 +100,9 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
 
     def observation(self, observation):
         return {
+            "current_fruit_type": observation["current_fruit_type"].astype(np.float32, copy=False),
+            "next_fruit_type": observation["next_fruit_type"].astype(np.float32, copy=False),
+            "current_fruit_x": observation["current_fruit_x"].astype(np.float32, copy=False),
             "board_fruit_xy": observation["board_fruit_xy"].astype(np.float32, copy=False),
             "board_fruit_radius": observation["board_fruit_radius"].astype(np.float32, copy=False),
             "board_fruit_mass": observation["board_fruit_mass"].astype(np.float32, copy=False),
@@ -101,16 +122,17 @@ class SuikaTransformerExtractor(BaseFeaturesExtractor):
 
     def __init__(self, observation_space: spaces.Dict):
         super().__init__(observation_space, features_dim=64)
-        self.max_tokens = 30
+        self.max_board_tokens = 30
         self.d_model = 64
         self.num_fruit_types = int(observation_space["board_fruit_type"].high.max()) + 1
 
-        # [x, y, radius, mass] + one-hot(type)
-        self.token_input_dim = 4 + self.num_fruit_types
+        # [x, y, radius, mass] + one-hot(type) + one-hot(source: current/next/board)
+        self.token_input_dim = 4 + self.num_fruit_types + 3
         self.token_proj = nn.Linear(self.token_input_dim, self.d_model)
 
         self.cls_token = nn.Parameter(th.zeros(1, 1, self.d_model))
-        self.pos_embed = nn.Parameter(th.zeros(1, self.max_tokens + 1, self.d_model))
+        self.total_tokens = 2 + self.max_board_tokens  # current + next + board(30)
+        self.pos_embed = nn.Parameter(th.zeros(1, self.total_tokens + 1, self.d_model))
 
         layer = nn.TransformerEncoderLayer(
             d_model=self.d_model,
@@ -132,27 +154,55 @@ class SuikaTransformerExtractor(BaseFeaturesExtractor):
         self._features_dim = self.d_model
 
     def forward(self, observations):
-        xy = observations["board_fruit_xy"].float().view(-1, self.max_tokens, 2)
-        radius = observations["board_fruit_radius"].float().view(-1, self.max_tokens, 1)
-        mass = observations["board_fruit_mass"].float().view(-1, self.max_tokens, 1)
-        mask = observations["board_fruit_mask"].float().view(-1, self.max_tokens)
+        xy = observations["board_fruit_xy"].float().view(-1, self.max_board_tokens, 2)
+        radius = observations["board_fruit_radius"].float().view(-1, self.max_board_tokens, 1)
+        mass = observations["board_fruit_mass"].float().view(-1, self.max_board_tokens, 1)
+        mask = observations["board_fruit_mask"].float().view(-1, self.max_board_tokens)
         t_idx = observations["board_fruit_type"].long().clamp(0, self.num_fruit_types - 1)
+        current_t_idx = observations["current_fruit_type"].long().squeeze(1).clamp(0, self.num_fruit_types - 1)
+        next_t_idx = observations["next_fruit_type"].long().squeeze(1).clamp(0, self.num_fruit_types - 1)
+        current_x = observations["current_fruit_x"].float()
 
-        t_onehot = F.one_hot(t_idx, num_classes=self.num_fruit_types).float()
-        t_onehot = t_onehot * mask.unsqueeze(-1)
+        # Board tokens
+        board_t_onehot = F.one_hot(t_idx, num_classes=self.num_fruit_types).float()
+        board_t_onehot = board_t_onehot * mask.unsqueeze(-1)
+        board_source = th.tensor([0.0, 0.0, 1.0], dtype=xy.dtype, device=xy.device).view(1, 1, 3)
+        board_source = board_source.expand(xy.shape[0], self.max_board_tokens, 3)
+        board_feat = th.cat([xy, radius, mass, board_t_onehot, board_source], dim=-1)
+        board_emb = self.token_proj(board_feat)
+        board_emb = board_emb * mask.unsqueeze(-1)
 
-        token_feat = th.cat([xy, radius, mass, t_onehot], dim=-1)
-        token_emb = self.token_proj(token_feat)
-        token_emb = token_emb * mask.unsqueeze(-1)
+        # Current-fruit token: source=[1,0,0], uses current x and type.
+        cur_xy = th.cat([current_x, th.zeros_like(current_x)], dim=1).unsqueeze(1)
+        cur_r = th.zeros((xy.shape[0], 1, 1), dtype=xy.dtype, device=xy.device)
+        cur_m = th.zeros((xy.shape[0], 1, 1), dtype=xy.dtype, device=xy.device)
+        cur_t = F.one_hot(current_t_idx, num_classes=self.num_fruit_types).float().unsqueeze(1)
+        cur_source = th.tensor([1.0, 0.0, 0.0], dtype=xy.dtype, device=xy.device).view(1, 1, 3)
+        cur_source = cur_source.expand(xy.shape[0], 1, 3)
+        cur_feat = th.cat([cur_xy, cur_r, cur_m, cur_t, cur_source], dim=-1)
+        cur_emb = self.token_proj(cur_feat)
 
+        # Next-fruit token: source=[0,1,0], type only (x/r/m set to 0).
+        nxt_xy = th.zeros((xy.shape[0], 1, 2), dtype=xy.dtype, device=xy.device)
+        nxt_r = th.zeros((xy.shape[0], 1, 1), dtype=xy.dtype, device=xy.device)
+        nxt_m = th.zeros((xy.shape[0], 1, 1), dtype=xy.dtype, device=xy.device)
+        nxt_t = F.one_hot(next_t_idx, num_classes=self.num_fruit_types).float().unsqueeze(1)
+        nxt_source = th.tensor([0.0, 1.0, 0.0], dtype=xy.dtype, device=xy.device).view(1, 1, 3)
+        nxt_source = nxt_source.expand(xy.shape[0], 1, 3)
+        nxt_feat = th.cat([nxt_xy, nxt_r, nxt_m, nxt_t, nxt_source], dim=-1)
+        nxt_emb = self.token_proj(nxt_feat)
+
+        token_emb = th.cat([cur_emb, nxt_emb, board_emb], dim=1)
         batch = token_emb.shape[0]
         cls = self.cls_token.expand(batch, -1, -1)
         seq = th.cat([cls, token_emb], dim=1)
-        seq = seq + self.pos_embed[:, : self.max_tokens + 1, :]
+        seq = seq + self.pos_embed[:, : self.total_tokens + 1, :]
 
+        fixed_valid = th.ones((batch, 2), dtype=th.bool, device=seq.device)
         pad_mask = th.cat(
             [
                 th.zeros(batch, 1, dtype=th.bool, device=seq.device),
+                ~fixed_valid,
                 (mask < 0.5),
             ],
             dim=1,
