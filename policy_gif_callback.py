@@ -13,8 +13,17 @@ import suika_env  # noqa: F401
 
 
 def _obs_to_hwc(raw_env):
-    # Use raw canvas capture from the browser env for GIF frames.
-    return raw_env.capture_canvas_raw_rgba()
+    # Use raw canvas capture from underlying browser env through wrappers.
+    base_env = getattr(raw_env, "unwrapped", raw_env)
+    if not hasattr(base_env, "capture_canvas_raw_rgba"):
+        raise AttributeError(f"{type(raw_env).__name__} has no capture_canvas_raw_rgba")
+    return base_env.capture_canvas_raw_rgba()
+
+
+def _build_model_obs(obs: dict, model: PPO) -> dict:
+    # Pass only keys the trained policy expects (supports train.py and train_transformer.py).
+    keys = model.observation_space.spaces.keys()
+    return {k: np.expand_dims(obs[k], axis=0) for k in keys}
 
 
 def _generate_policy_gif_worker(
@@ -30,9 +39,6 @@ def _generate_policy_gif_worker(
     port_base: int,
 ):
     try:
-        # Import wrappers lazily to avoid import cycle at module import time.
-        from train import SuikaObsWrapper
-
         model = PPO.load(model_path, device="cpu")
 
         def make_eval_env(rank: int):
@@ -50,7 +56,7 @@ def _generate_policy_gif_worker(
             return env
 
         raw_envs = [make_eval_env(0)]
-        envs = [SuikaObsWrapper(e) for e in raw_envs]
+        envs = raw_envs
         frames = []
         obs_list = []
         for i, env in enumerate(envs):
@@ -65,7 +71,7 @@ def _generate_policy_gif_worker(
             done = False
             for i, env in enumerate(envs):
                 obs = obs_list[i]
-                model_obs = {k: np.expand_dims(v, axis=0) for k, v in obs.items()}
+                model_obs = _build_model_obs(obs, model)
                 action, _ = model.predict(model_obs, deterministic=True)
                 action = np.asarray(action).reshape(-1)
                 obs2, _, terminated, truncated, _ = env.step(action)
