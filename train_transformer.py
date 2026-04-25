@@ -119,7 +119,7 @@ class SuikaTransformerExtractor(BaseFeaturesExtractor):
             dropout=0.0,
             activation="gelu",
             batch_first=True,
-            norm_first=True,
+            norm_first=False,
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=2)
         # Residual MLP block on CLS output.
