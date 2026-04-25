@@ -12,19 +12,14 @@ from stable_baselines3.common.callbacks import BaseCallback
 import suika_env  # noqa: F401
 
 
-def _obs_to_hwc(obs_dict):
-    # obs["image"]: (C*k, H, W). Use latest RGBA frame (last 4 channels).
-    chw = obs_dict["image"]
-    if chw.shape[0] >= 4:
-        latest = chw[-4:, :, :]
-    else:
-        latest = chw
-    return np.transpose(latest, (1, 2, 0))
+def _obs_to_hwc(raw_env):
+    # Use raw canvas capture from the browser env for GIF frames.
+    return raw_env.capture_canvas_raw_rgba()
 
 
 def _generate_policy_gif_worker(
     model_path: str,
-    steps_per_gif: int,
+    max_steps_per_episode: int,
     fps: int,
     gif_path: str,
     export_idx: int,
@@ -32,12 +27,11 @@ def _generate_policy_gif_worker(
     verbose: int,
     seed: int,
     headless: bool,
-    frame_stack: int,
     port_base: int,
 ):
     try:
         # Import wrappers lazily to avoid import cycle at module import time.
-        from train import SuikaFrameStackWrapper, SuikaObsWrapper
+        from train import SuikaObsWrapper
 
         model = PPO.load(model_path, device="cpu")
 
@@ -53,32 +47,42 @@ def _generate_policy_gif_worker(
                 ready_poll_interval=0.02,
                 ready_timeout=2.0,
             )
-            env = SuikaObsWrapper(env)
-            env = SuikaFrameStackWrapper(env, k=frame_stack)
             return env
 
-        envs = [make_eval_env(0)]
+        raw_envs = [make_eval_env(0)]
+        envs = [SuikaObsWrapper(e) for e in raw_envs]
         frames = []
         obs_list = []
         for i, env in enumerate(envs):
             obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
             obs_list.append(obs)
 
-        frames.append(_obs_to_hwc(obs_list[0]))
+        frames.append(_obs_to_hwc(raw_envs[0]))
 
-        for _ in range(steps_per_gif):
+        step_count = 0
+        while True:
             next_obs_list = []
+            done = False
             for i, env in enumerate(envs):
                 obs = obs_list[i]
                 model_obs = {k: np.expand_dims(v, axis=0) for k, v in obs.items()}
                 action, _ = model.predict(model_obs, deterministic=True)
                 action = np.asarray(action).reshape(-1)
                 obs2, _, terminated, truncated, _ = env.step(action)
-                if terminated or truncated:
-                    obs2, _ = env.reset()
+                done = done or bool(terminated or truncated)
                 next_obs_list.append(obs2)
             obs_list = next_obs_list
-            frames.append(_obs_to_hwc(obs_list[0]))
+            frames.append(_obs_to_hwc(raw_envs[0]))
+            step_count += 1
+            if done:
+                break
+            if max_steps_per_episode > 0 and step_count >= max_steps_per_episode:
+                if verbose > 0:
+                    print(
+                        "[PolicyGifCallback] Reached GIF max steps without episode end: "
+                        f"max_steps={max_steps_per_episode}"
+                    )
+                break
 
         imageio.mimsave(gif_path, frames, fps=fps)
         if verbose > 0:
@@ -90,7 +94,13 @@ def _generate_policy_gif_worker(
         raise
     finally:
         envs = locals().get("envs", [])
+        raw_envs = locals().get("raw_envs", [])
         for env in envs:
+            try:
+                env.close()
+            except Exception:
+                pass
+        for env in raw_envs:
             try:
                 env.close()
             except Exception:
@@ -103,23 +113,21 @@ class PolicyGifCallback(BaseCallback):
     def __init__(
         self,
         every_steps: int,
-        steps_per_gif: int,
+        max_steps_per_episode: int,
         fps: int,
         out_dir: Path,
         seed: int,
         headless: bool,
-        frame_stack: int,
         port_base: int,
         verbose: int = 0,
     ):
         super().__init__(verbose=verbose)
         self.every_steps = max(1, int(every_steps))
-        self.steps_per_gif = max(1, int(steps_per_gif))
+        self.max_steps_per_episode = int(max_steps_per_episode)
         self.fps = max(1, int(fps))
         self.out_dir = out_dir
         self.seed = int(seed)
         self.headless = bool(headless)
-        self.frame_stack = max(1, int(frame_stack))
         self.port_base = int(port_base)
         self._last_export_at = 0
         self._export_idx = 0
@@ -138,7 +146,7 @@ class PolicyGifCallback(BaseCallback):
             target=_generate_policy_gif_worker,
             args=(
                 str(model_path),
-                self.steps_per_gif,
+                self.max_steps_per_episode,
                 self.fps,
                 str(gif_path),
                 self._export_idx,
@@ -146,7 +154,6 @@ class PolicyGifCallback(BaseCallback):
                 self.verbose,
                 self.seed,
                 self.headless,
-                self.frame_stack,
                 self.port_base,
             ),
             daemon=False,

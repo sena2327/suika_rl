@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
-from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -46,129 +45,161 @@ def restore_terminal_cursor():
 
 
 class SuikaObsWrapper(gym.ObservationWrapper):
-    """Convert image HWC->CHW and keep aux features for policy input."""
+    """Use feature-only observation for policy input (no image)."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        img_space = env.observation_space["image"]
         fruit_type_space = env.observation_space["current_fruit_type"]
+        next_fruit_type_space = env.observation_space["next_fruit_type"]
         fruit_x_space = env.observation_space["current_fruit_x"]
-        h, w, c = img_space.shape
+        stage_top10_xy_space = env.observation_space["stage_top10_xy"]
+        top10_fruit_types_space = env.observation_space["top10_fruit_types"]
+        top10_mask_space = env.observation_space["top10_mask"]
+        max_height_space = env.observation_space["max_height"]
+        danger_count_space = env.observation_space["danger_count"]
+        largest_fruit_type_space = env.observation_space["largest_fruit_type"]
+        fruit_count_space = env.observation_space["fruit_count"]
         self.observation_space = spaces.Dict(
             {
-                "image": spaces.Box(low=0, high=255, shape=(c, h, w), dtype=np.uint8),
                 "current_fruit_type": spaces.Box(
                     low=fruit_type_space.low.astype(np.float32),
                     high=fruit_type_space.high.astype(np.float32),
                     shape=fruit_type_space.shape,
                     dtype=np.float32,
                 ),
+                "next_fruit_type": spaces.Box(
+                    low=next_fruit_type_space.low.astype(np.float32),
+                    high=next_fruit_type_space.high.astype(np.float32),
+                    shape=next_fruit_type_space.shape,
+                    dtype=np.float32,
+                ),
                 "current_fruit_x": spaces.Box(
                     low=fruit_x_space.low.astype(np.float32),
                     high=fruit_x_space.high.astype(np.float32),
                     shape=fruit_x_space.shape,
+                    dtype=np.float32,
+                ),
+                "stage_top10_xy": spaces.Box(
+                    low=stage_top10_xy_space.low.astype(np.float32),
+                    high=stage_top10_xy_space.high.astype(np.float32),
+                    shape=stage_top10_xy_space.shape,
+                    dtype=np.float32,
+                ),
+                "top10_fruit_types": spaces.Box(
+                    low=top10_fruit_types_space.low.astype(np.float32),
+                    high=top10_fruit_types_space.high.astype(np.float32),
+                    shape=top10_fruit_types_space.shape,
+                    dtype=np.float32,
+                ),
+                "top10_mask": spaces.Box(
+                    low=top10_mask_space.low.astype(np.float32),
+                    high=top10_mask_space.high.astype(np.float32),
+                    shape=top10_mask_space.shape,
+                    dtype=np.float32,
+                ),
+                "max_height": spaces.Box(
+                    low=max_height_space.low.astype(np.float32),
+                    high=max_height_space.high.astype(np.float32),
+                    shape=max_height_space.shape,
+                    dtype=np.float32,
+                ),
+                "danger_count": spaces.Box(
+                    low=danger_count_space.low.astype(np.float32),
+                    high=danger_count_space.high.astype(np.float32),
+                    shape=danger_count_space.shape,
+                    dtype=np.float32,
+                ),
+                "largest_fruit_type": spaces.Box(
+                    low=largest_fruit_type_space.low.astype(np.float32),
+                    high=largest_fruit_type_space.high.astype(np.float32),
+                    shape=largest_fruit_type_space.shape,
+                    dtype=np.float32,
+                ),
+                "fruit_count": spaces.Box(
+                    low=fruit_count_space.low.astype(np.float32),
+                    high=fruit_count_space.high.astype(np.float32),
+                    shape=fruit_count_space.shape,
                     dtype=np.float32,
                 ),
             }
         )
 
     def observation(self, observation):
-        image = np.transpose(observation["image"], (2, 0, 1)).copy()
         fruit_type = observation["current_fruit_type"].astype(np.float32, copy=False)
+        next_fruit_type = observation["next_fruit_type"].astype(np.float32, copy=False)
         fruit_x = observation["current_fruit_x"].astype(np.float32, copy=False)
-        return {"image": image, "current_fruit_type": fruit_type, "current_fruit_x": fruit_x}
+        stage_top10_xy = observation["stage_top10_xy"].astype(np.float32, copy=False)
+        top10_fruit_types = observation["top10_fruit_types"].astype(np.float32, copy=False)
+        top10_mask = observation["top10_mask"].astype(np.float32, copy=False)
+        max_height = observation["max_height"].astype(np.float32, copy=False)
+        danger_count = observation["danger_count"].astype(np.float32, copy=False)
+        largest_fruit_type = observation["largest_fruit_type"].astype(np.float32, copy=False)
+        fruit_count = observation["fruit_count"].astype(np.float32, copy=False)
+        return {
+            "current_fruit_type": fruit_type,
+            "next_fruit_type": next_fruit_type,
+            "current_fruit_x": fruit_x,
+            "stage_top10_xy": stage_top10_xy,
+            "top10_fruit_types": top10_fruit_types,
+            "top10_mask": top10_mask,
+            "max_height": max_height,
+            "danger_count": danger_count,
+            "largest_fruit_type": largest_fruit_type,
+            "fruit_count": fruit_count,
+        }
 
 
 class SuikaCombinedExtractor(BaseFeaturesExtractor):
-    """Small CNN for image + (fruit type embedding + position), then concatenate."""
+    """Feature-only extractor (no image)."""
 
     def __init__(self, observation_space: spaces.Dict):
         super().__init__(observation_space, features_dim=1)
 
-        n_input_channels = observation_space["image"].shape[0]
-        self.cnn = nn.Sequential(
-            nn.Conv2d(n_input_channels, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
-        )
-        with th.no_grad():
-            sample = th.as_tensor(observation_space["image"].sample()[None]).float()
-            n_flatten = self.cnn(sample).shape[1]
-
         num_fruit_types = int(observation_space["current_fruit_type"].high[0]) + 1
-        self.fruit_type_embedding = nn.Embedding(num_fruit_types, 8)
-        self.image_head = nn.Sequential(nn.Linear(n_flatten, 256), nn.ReLU())
-        self.aux_head = nn.Sequential(nn.Linear(9, 16), nn.ReLU())
-        self._features_dim = 256 + 16
+        self.current_fruit_embedding = nn.Embedding(num_fruit_types, 8)
+        self.next_fruit_embedding = nn.Embedding(num_fruit_types, 8)
+        self.largest_fruit_embedding = nn.Embedding(num_fruit_types, 4)
+        self.top10_fruit_embedding = nn.Embedding(num_fruit_types, 4)
+        self.num_fruit_types = num_fruit_types
+        # 8(current type emb) + 8(next type emb) + 4(largest type emb)
+        # + 40(top10 type emb with mask) + 1(current x) + 20(top10 xy) + 10(top10 mask)
+        # + 1(max height) + 1(danger count) + 1(fruit count) = 94
+        self.aux_head = nn.Sequential(nn.Linear(94, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU())
+        self._features_dim = 64
 
     def forward(self, observations):
-        img = observations["image"].float() / 255.0
         fruit_x = observations["current_fruit_x"].float()
+        stage_top10_xy = observations["stage_top10_xy"].float()
+        top10_fruit_types = observations["top10_fruit_types"].long().clamp(0, self.num_fruit_types - 1)
+        top10_mask = observations["top10_mask"].float()
+        max_height = observations["max_height"].float()
+        danger_count = observations["danger_count"].float() / 10.0
+        fruit_count = observations["fruit_count"].float() / 50.0
         fruit_type_idx = observations["current_fruit_type"].long().squeeze(1)
-        fruit_type_emb = self.fruit_type_embedding(fruit_type_idx)
-        aux = th.cat([fruit_type_emb, fruit_x], dim=1)
-        img_feat = self.image_head(self.cnn(img))
-        aux_feat = self.aux_head(aux)
-        return th.cat([img_feat, aux_feat], dim=1)
-
-
-class SuikaFrameStackWrapper(gym.Wrapper):
-    """Stack last k image observations on channel axis (C*k, H, W)."""
-
-    def __init__(self, env: gym.Env, k: int = 3):
-        super().__init__(env)
-        self.k = max(1, int(k))
-        self._frames = deque(maxlen=self.k)
-        img_space = env.observation_space["image"]
-        fruit_type_space = env.observation_space["current_fruit_type"]
-        fruit_x_space = env.observation_space["current_fruit_x"]
-        c, h, w = img_space.shape
-        self.observation_space = spaces.Dict(
-            {
-                "image": spaces.Box(
-                    low=0,
-                    high=255,
-                    shape=(c * self.k, h, w),
-                    dtype=np.uint8,
-                ),
-                "current_fruit_type": spaces.Box(
-                    low=fruit_type_space.low.astype(np.float32),
-                    high=fruit_type_space.high.astype(np.float32),
-                    shape=fruit_type_space.shape,
-                    dtype=np.float32,
-                ),
-                "current_fruit_x": spaces.Box(
-                    low=fruit_x_space.low.astype(np.float32),
-                    high=fruit_x_space.high.astype(np.float32),
-                    shape=fruit_x_space.shape,
-                    dtype=np.float32,
-                ),
-            }
+        next_fruit_type_idx = observations["next_fruit_type"].long().squeeze(1)
+        largest_fruit_type_idx = observations["largest_fruit_type"].long().squeeze(1)
+        fruit_type_emb = self.current_fruit_embedding(fruit_type_idx)
+        next_fruit_emb = self.next_fruit_embedding(next_fruit_type_idx)
+        largest_fruit_emb = self.largest_fruit_embedding(largest_fruit_type_idx)
+        top10_type_emb = self.top10_fruit_embedding(top10_fruit_types)
+        top10_type_emb = top10_type_emb * top10_mask.unsqueeze(-1)
+        top10_type_emb = top10_type_emb.flatten(start_dim=1)
+        aux = th.cat(
+            [
+                fruit_type_emb,
+                next_fruit_emb,
+                largest_fruit_emb,
+                top10_type_emb,
+                fruit_x,
+                stage_top10_xy,
+                top10_mask,
+                max_height,
+                danger_count,
+                fruit_count,
+            ],
+            dim=1,
         )
-
-    def _build_obs(self, obs):
-        stacked = np.concatenate(list(self._frames), axis=0)
-        return {
-            "image": stacked,
-            "current_fruit_type": obs["current_fruit_type"],
-            "current_fruit_x": obs["current_fruit_x"],
-        }
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        self._frames.clear()
-        for _ in range(self.k):
-            self._frames.append(obs["image"].copy())
-        return self._build_obs(obs), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._frames.append(obs["image"].copy())
-        return self._build_obs(obs), reward, terminated, truncated, info
+        return self.aux_head(aux)
 
 
 class BrowserRestartCallback(BaseCallback):
@@ -248,13 +279,15 @@ class FinalScoreLoggingCallback(BaseCallback):
 
 
 class ActionStatsLoggingCallback(BaseCallback):
-    """Log action-x mean/variance during rollout collection."""
+    """Log clipped action-x mean/variance during rollout collection."""
 
     def __init__(self, verbose: int = 0):
         super().__init__(verbose=verbose)
 
     def _on_step(self) -> bool:
-        actions = self.locals.get("actions", None)
+        actions = self.locals.get("clipped_actions", None)
+        if actions is None:
+            actions = self.locals.get("actions", None)
         if actions is None:
             return True
 
@@ -287,7 +320,6 @@ def make_env(
     headless: bool,
     delay: float,
     port_base: int,
-    frame_stack: int,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env = gym.make(
@@ -301,7 +333,6 @@ def make_env(
             ready_timeout=2.0,
         )
         env = SuikaObsWrapper(env)
-        env = SuikaFrameStackWrapper(env, k=frame_stack)
         return env
 
     return _init
@@ -327,7 +358,6 @@ def parse_args():
         ),
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--frame-stack", type=int, default=1, help="Number of stacked image frames.")
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
@@ -357,8 +387,8 @@ def parse_args():
     p.add_argument(
         "--gif-eval-steps",
         type=int,
-        default=120,
-        help="Number of policy steps recorded into each GIF.",
+        default=400,
+        help="Safety cap for policy steps per GIF episode (0 disables cap).",
     )
     p.add_argument(
         "--gif-fps",
@@ -372,7 +402,7 @@ def parse_args():
         default=Path("gifs"),
         help="Directory for periodic policy GIFs.",
     )
-    p.add_argument("--device", type=str, default="auto", help="SB3 device, e.g. auto|cpu|cuda")
+    p.add_argument("--device", type=str, default="cuda", help="SB3 device, e.g. auto|cpu|cuda")
     p.add_argument(
         "--gpu-id",
         type=int,
@@ -409,7 +439,6 @@ def main():
             args.headless,
             args.delay_before_img_capture,
             args.port_base,
-            args.frame_stack,
         )
         for i in range(args.n_envs)
     ]
@@ -426,7 +455,6 @@ def main():
             "total_timesteps": args.total_timesteps,
             "n_envs": args.n_envs,
             "seed": args.seed,
-            "frame_stack": args.frame_stack,
             "delay_before_img_capture": args.delay_before_img_capture,
             "headless": args.headless,
             "learning_rate": 3e-4,
@@ -488,12 +516,11 @@ def main():
             callbacks.append(
                 PolicyGifCallback(
                     every_steps=args.gif_eval_every_steps,
-                    steps_per_gif=args.gif_eval_steps,
+                    max_steps_per_episode=args.gif_eval_steps,
                     fps=args.gif_fps,
                     out_dir=args.gif_dir,
                     seed=args.seed,
                     headless=args.headless,
-                    frame_stack=args.frame_stack,
                     port_base=args.port_base,
                     verbose=1,
                 )

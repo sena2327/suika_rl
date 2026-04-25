@@ -407,3 +407,4 @@ const resizeCanvas = () => {
 document.body.onload = resizeCanvas;
 document.body.onresize = resizeCanvas;
 window.Game = Game
+window.__suikaEngine = engine
