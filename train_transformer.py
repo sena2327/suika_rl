@@ -383,6 +383,7 @@ def main():
                     seed=args.seed,
                     headless=args.headless,
                     port_base=args.port_base,
+                    total_timesteps=args.total_timesteps,
                     verbose=1,
                 )
             )

@@ -35,6 +35,7 @@ def parse_args():
     p.add_argument("--fps", type=float, default=10.0)
     p.add_argument("--table-rows", type=int, default=20)
     p.add_argument("--mute-sound", action="store_true", default=True)
+    p.add_argument("--quiet", action="store_true", default=False, help="Disable per-step stdout logs.")
     return p.parse_args()
 
 
@@ -66,6 +67,18 @@ def get_frame(env) -> np.ndarray:
     return img
 
 
+def get_raw_js_score(env) -> float:
+    base = getattr(env, "unwrapped", env)
+    driver = getattr(base, "driver", None)
+    if driver is None:
+        return float("nan")
+    try:
+        v = driver.execute_script("return Number.isFinite(window.Game?.score) ? window.Game.score : NaN;")
+        return float(v) if v is not None else float("nan")
+    except Exception:
+        return float("nan")
+
+
 def main():
     args = parse_args()
 
@@ -84,6 +97,7 @@ def main():
 
     rows = deque(maxlen=max(5, args.table_rows))
     delay = 1.0 / max(1e-6, args.fps)
+    ep_return = 0.0
 
     fig, (ax_img, ax_tbl) = plt.subplots(
         1,
@@ -118,12 +132,22 @@ def main():
 
             obs, reward, terminated, truncated, info = env.step(np.asarray(action).reshape(-1))
             score = float(info.get("score", 0.0))
+            ep_return += float(reward)
 
-            rows.append((step, x, sigma, float(reward), score))
-            lines = ["step      x        sigma    reward   score", "-" * 44]
-            for s, xv, sv, rv, sc in rows:
-                lines.append(f"{s:>4d}  {xv:>7.3f}  {sv:>8.4f}  {rv:>7.1f}  {sc:>7.1f}")
+            raw_js_score = get_raw_js_score(env)
+            rows.append((step, x, sigma, float(reward), score, raw_js_score, ep_return))
+            lines = ["step      x        sigma      reward   info_score   js_score   ep_return", "-" * 78]
+            for s, xv, sv, rv, sc, jsc, er in rows:
+                lines.append(
+                    f"{s:>4d}  {xv:>7.3f}  {sv:>8.4f}  {rv:>10.3f}  {sc:>10.1f}  {jsc:>9.1f}  {er:>10.3f}"
+                )
             txt.set_text("\n".join(lines))
+            if not args.quiet:
+                print(
+                    f"step={step:>4d} x={x:+.4f} sigma={sigma:.5f} "
+                    f"reward={float(reward):+.5f} score={score:.1f} js_score={raw_js_score:.1f} "
+                    f"ep_return={ep_return:+.5f}"
+                )
 
             frame = get_frame(env)
             im.set_data(frame)
@@ -134,7 +158,14 @@ def main():
             plt.pause(delay)
 
             if terminated or truncated:
+                if not args.quiet:
+                    print(
+                        f"[episode_end] step={step} terminated={terminated} "
+                        f"truncated={truncated} final_score={score:.1f} js_score={raw_js_score:.1f} "
+                        f"ep_return={ep_return:+.5f}"
+                    )
                 obs, _ = env.reset()
+                ep_return = 0.0
 
     finally:
         env.close()

@@ -56,7 +56,8 @@ def _generate_policy_gif_worker(
 ):
     try:
         model = PPO.load(model_path, device="cpu")
-        action_log_path = str(Path(gif_path).with_name("latest_policy_action.txt"))
+        gif_file = Path(gif_path)
+        action_log_path = str(gif_file.with_name(f"{gif_file.stem}_action.txt"))
 
         def make_eval_env(rank: int):
             port = port_base + 1000 + rank
@@ -152,6 +153,7 @@ class PolicyGifCallback(BaseCallback):
         seed: int,
         headless: bool,
         port_base: int,
+        total_timesteps: int | None = None,
         verbose: int = 0,
     ):
         super().__init__(verbose=verbose)
@@ -162,14 +164,20 @@ class PolicyGifCallback(BaseCallback):
         self.seed = int(seed)
         self.headless = bool(headless)
         self.port_base = int(port_base)
+        self.total_timesteps_target = int(total_timesteps) if total_timesteps is not None else None
         self._last_export_at = 0
         self._export_idx = 0
         self._proc: mp.Process | None = None
+        self._pending_milestones: list[tuple[int, int]] = []
+        self._done_milestone_pcts: set[int] = set()
+        if self.total_timesteps_target is not None and self.total_timesteps_target > 0:
+            for pct in range(10, 101, 10):
+                step = max(1, int(self.total_timesteps_target * pct / 100))
+                self._pending_milestones.append((pct, step))
 
-    def _start_policy_gif_process(self):
+    def _start_policy_gif_process(self, gif_name: str):
         self.out_dir.mkdir(parents=True, exist_ok=True)
-        # Keep only one GIF path (overwrite).
-        gif_path = self.out_dir / "latest_policy.gif"
+        gif_path = self.out_dir / gif_name
         model_path = self.out_dir / "latest_policy_model.zip"
         self.model.save(str(model_path))
 
@@ -203,22 +211,34 @@ class PolicyGifCallback(BaseCallback):
         if self._proc is not None and not self._proc.is_alive():
             self._proc = None
 
-        if (self.num_timesteps - self._last_export_at) < self.every_steps:
-            return True
-
-        # If previous export is still running, skip this trigger to avoid queueing.
         if self._proc is not None and self._proc.is_alive():
-            if self.verbose > 0:
-                print(
-                    f"[PolicyGifCallback] Skip export at step={self.num_timesteps} "
-                    "(previous GIF worker still running)"
-                )
-            self._last_export_at = self.num_timesteps
             return True
 
-        self._start_policy_gif_process()
-        self._last_export_at = self.num_timesteps
-        self._export_idx += 1
+        # 10%-milestone exports (policy_10pct.gif ... policy_100pct.gif).
+        if self._pending_milestones:
+            ready = [(pct, step) for (pct, step) in self._pending_milestones if self.num_timesteps >= step]
+            if ready:
+                pct, step = ready[0]
+                self._pending_milestones = [
+                    (p, s) for (p, s) in self._pending_milestones if p != pct
+                ]
+                if pct not in self._done_milestone_pcts:
+                    gif_name = f"policy_{pct}pct.gif"
+                    self._start_policy_gif_process(gif_name=gif_name)
+                    self._done_milestone_pcts.add(pct)
+                    if self.verbose > 0:
+                        print(
+                            f"[PolicyGifCallback] Milestone GIF queued: {gif_name} "
+                            f"at step={self.num_timesteps} (target={step})"
+                        )
+                    self._export_idx += 1
+                    return True
+
+        # Periodic latest GIF export.
+        if (self.num_timesteps - self._last_export_at) >= self.every_steps:
+            self._start_policy_gif_process(gif_name="latest_policy.gif")
+            self._last_export_at = self.num_timesteps
+            self._export_idx += 1
         return True
 
     def _on_training_end(self) -> None:

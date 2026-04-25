@@ -326,6 +326,11 @@ class SuikaBrowserEnv(gymnasium.Env):
                 time.sleep(self.delay_before_img_capture)
 
             obs, status, score = self._get_obs_and_status()
+            js_score = self.driver.execute_script(
+                "return Number.isFinite(window.Game?.score) ? window.Game.score : null;"
+            )
+            if js_score is not None:
+                score = float(js_score)
             # check if game is over.
             terminal = status == 3
             truncated = False 
@@ -345,12 +350,32 @@ class SuikaBrowserEnv(gymnasium.Env):
             return obs, 0.0, True, True, info
 
     def _wait_until_step_stable(self):
-        # In the JS game, DROP state is 2. We poll until it changes or timeout.
+        # In the JS game, DROP state is 2.
+        # Waiting only for state transition can be too early for score update,
+        # so we additionally wait until score stays unchanged for a short window.
         start = time.time()
+        stable_polls = 0
+        last_score = None
         while True:
-            state = self.driver.execute_script("return window.Game.stateIndex;")
+            state, score = self.driver.execute_script("""
+                return [
+                    Number.isFinite(window.Game?.stateIndex) ? window.Game.stateIndex : 0,
+                    Number.isFinite(window.Game?.score) ? window.Game.score : 0
+                ];
+            """)
+
             if state != 2:
-                return
+                if last_score is not None and score == last_score:
+                    stable_polls += 1
+                else:
+                    stable_polls = 0
+                last_score = score
+                if stable_polls >= 5:
+                    return
+            else:
+                stable_polls = 0
+                last_score = score
+
             if (time.time() - start) >= self.ready_timeout:
                 return
             time.sleep(self.ready_poll_interval)

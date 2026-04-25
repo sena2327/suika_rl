@@ -264,8 +264,10 @@ class FinalScoreLoggingCallback(BaseCallback):
             score = info.get("score", None)
             if score is None:
                 continue
-            final_scores.append(float(score))
-            wandb.log({"rollout/final_score": float(score)}, step=self.num_timesteps)
+            score_f = float(score)
+            final_scores.append(score_f)
+            # Aggregate done-episode scores within current SB3 log window.
+            self.logger.record_mean("rollout/final_score", score_f)
 
         if final_scores:
             mean_score = float(np.mean(final_scores))
@@ -302,15 +304,9 @@ class ActionStatsLoggingCallback(BaseCallback):
 
         x_mean = float(np.mean(x))
         x_var = float(np.var(x))
-        self.logger.record("rollout/action_x_mean", x_mean)
-        self.logger.record("rollout/action_x_var", x_var)
-        wandb.log(
-            {
-                "rollout/action_x_mean": x_mean,
-                "rollout/action_x_var": x_var,
-            },
-            step=self.num_timesteps,
-        )
+        # Mean over callback calls within rollout/log window.
+        self.logger.record_mean("rollout/action_x_mean", x_mean)
+        self.logger.record_mean("rollout/action_x_var", x_var)
         return True
 
 
@@ -335,14 +331,6 @@ class PolicyStdLoggingCallback(BaseCallback):
         self.logger.record("rollout/policy_log_std_mean", log_std_mean)
         self.logger.record("rollout/policy_std_mean", std_mean)
         self.logger.record("rollout/policy_std_var", std_var)
-        wandb.log(
-            {
-                "rollout/policy_log_std_mean": log_std_mean,
-                "rollout/policy_std_mean": std_mean,
-                "rollout/policy_std_var": std_var,
-            },
-            step=self.num_timesteps,
-        )
 
 
 def make_env(
@@ -554,6 +542,7 @@ def main():
                     seed=args.seed,
                     headless=args.headless,
                     port_base=args.port_base,
+                    total_timesteps=args.total_timesteps,
                     verbose=1,
                 )
             )
