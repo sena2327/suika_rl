@@ -94,12 +94,14 @@ def _generate_policy_gif_worker(
                 sigma = _get_sigma(model, model_obs)
                 action, _ = model.predict(model_obs, deterministic=False)
                 action = np.asarray(action).reshape(-1)
-                obs2, reward, terminated, truncated, _ = env.step(action)
+                obs2, reward, terminated, truncated, info = env.step(action)
                 done = done or bool(terminated or truncated)
                 next_obs_list.append(obs2)
                 x = float(action[0]) if action.size > 0 else float("nan")
+                score = float(info.get("score", float("nan")))
                 action_logs.append(
-                    f"{step_count + 1}\t{float(reward):.6f}\t{x:.6f}\t{action.tolist()}\t{sigma:.6f}"
+                    f"{step_count + 1}\t{float(reward):.6f}\t{x:.6f}\t{action.tolist()}\t"
+                    f"{sigma:.6f}\t{score:.6f}\t{int(bool(terminated))}\t{int(bool(truncated))}"
                 )
             obs_list = next_obs_list
             frames.append(_obs_to_hwc(raw_envs[0]))
@@ -116,7 +118,7 @@ def _generate_policy_gif_worker(
 
         imageio.mimsave(gif_path, frames, fps=fps)
         with open(action_log_path, "w", encoding="utf-8") as f:
-            f.write("step\treward\tx\taction\tsigma\n")
+            f.write("step\treward\tx\taction\tsigma\tscore\tterminated\ttruncated\n")
             for line in action_logs:
                 f.write(line + "\n")
         if verbose > 0:

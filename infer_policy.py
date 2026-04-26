@@ -164,8 +164,7 @@ def main():
                         f"truncated={truncated} final_score={score:.1f} js_score={raw_js_score:.1f} "
                         f"ep_return={ep_return:+.5f}"
                     )
-                obs, _ = env.reset()
-                ep_return = 0.0
+                break
 
     finally:
         env.close()

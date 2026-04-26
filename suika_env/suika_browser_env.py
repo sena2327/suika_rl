@@ -78,11 +78,11 @@ class SuikaBrowserEnv(gymnasium.Env):
             'danger_count': gymnasium.spaces.Box(low=0, high=500, shape=(1,), dtype="float32"),
             'largest_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'fruit_count': gymnasium.spaces.Box(low=0, high=500, shape=(1,), dtype="float32"),
-            'board_fruit_xy': gymnasium.spaces.Box(low=0, high=1, shape=(60,), dtype="float32"),
-            'board_fruit_radius': gymnasium.spaces.Box(low=0, high=1, shape=(30,), dtype="float32"),
-            'board_fruit_mass': gymnasium.spaces.Box(low=0, high=1, shape=(30,), dtype="float32"),
-            'board_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(30,), dtype="float32"),
-            'board_fruit_mask': gymnasium.spaces.Box(low=0, high=1, shape=(30,), dtype="float32"),
+            'board_fruit_xy': gymnasium.spaces.Box(low=0, high=1, shape=(80,), dtype="float32"),
+            'board_fruit_radius': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
+            'board_fruit_mass': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
+            'board_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(40,), dtype="float32"),
+            'board_fruit_mask': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
         }
         self.observation_space = gymnasium.spaces.Dict(_obs_dict)
         self.action_space = gymnasium.spaces.Box(low=-0.5, high=0.5, shape=(1,), dtype=np.float32)
@@ -215,7 +215,7 @@ class SuikaBrowserEnv(gymnasium.Env):
                   top10Types.push(t);
                   top10Mask.push(1.0);
                 }
-                const boardFruits = sortedByY.slice(0, 30);
+                const boardFruits = sortedByY.slice(0, 40);
                 for (const b of boardFruits) {
                   let nx = b.position.x / 640.0;
                   let ny = b.position.y / 960.0;
@@ -236,11 +236,11 @@ class SuikaBrowserEnv(gymnasium.Env):
                 while (top10Types.length < 10) top10Types.push(0.0);
                 while (top10Mask.length < 10) top10Mask.push(0.0);
                 while (top10.length < 20) top10.push(0.0);
-                while (boardXY.length < 60) boardXY.push(0.0);
-                while (boardRadius.length < 30) boardRadius.push(0.0);
-                while (boardMass.length < 30) boardMass.push(0.0);
-                while (boardType.length < 30) boardType.push(0.0);
-                while (boardMask.length < 30) boardMask.push(0.0);
+                while (boardXY.length < 80) boardXY.push(0.0);
+                while (boardRadius.length < 40) boardRadius.push(0.0);
+                while (boardMass.length < 40) boardMass.push(0.0);
+                while (boardType.length < 40) boardType.push(0.0);
+                while (boardMask.length < 40) boardMask.push(0.0);
                 const fruitCount = fruits.length;
                 const largestFruitType = fruits.reduce((m, b) => Math.max(m, Number.isFinite(b.sizeIndex) ? b.sizeIndex : 0), 0);
                 const minY = fruits.length > 0 ? Math.min(...fruits.map((b) => b.position.y)) : 960;
@@ -283,11 +283,11 @@ class SuikaBrowserEnv(gymnasium.Env):
                     "danger_count": 0.0,
                     "largest_fruit_type": 0.0,
                     "fruit_count": 0.0,
-                    "board_fruit_xy": [0.0] * 60,
-                    "board_fruit_radius": [0.0] * 30,
-                    "board_fruit_mass": [0.0] * 30,
-                    "board_fruit_type": [0.0] * 30,
-                    "board_fruit_mask": [0.0] * 30,
+                    "board_fruit_xy": [0.0] * 80,
+                    "board_fruit_radius": [0.0] * 40,
+                    "board_fruit_mass": [0.0] * 40,
+                    "board_fruit_type": [0.0] * 40,
+                    "board_fruit_mask": [0.0] * 40,
                 }
             time.sleep(0.02)
 
@@ -337,8 +337,15 @@ class SuikaBrowserEnv(gymnasium.Env):
             )
             if js_score is not None:
                 score = float(js_score)
+            # Robust game-over detection: stateIndex LOSE or visible end UI.
+            js_state, end_visible = self.driver.execute_script("""
+                return [
+                    Number.isFinite(window.Game?.stateIndex) ? window.Game.stateIndex : null,
+                    getComputedStyle(document.getElementById('game-end-container')).display !== 'none'
+                ];
+            """)
             # check if game is over.
-            terminal = status == 3
+            terminal = (status == 3) or (js_state == 3) or bool(end_visible)
             truncated = False 
             info['score'] = score
             reward = score - self.score
@@ -349,11 +356,13 @@ class SuikaBrowserEnv(gymnasium.Env):
             return obs, reward, terminal, truncated, info
         except (TimeoutException, WebDriverException, ReadTimeoutError, TimeoutError, OSError) as exc:
             # Recover from browser crashes/timeouts instead of killing the worker process.
+            prev_score = float(self.score)
             info["browser_error"] = str(exc)
             info["recovered"] = True
+            info["score"] = prev_score
             self._restart_driver()
             obs, _ = self.reset()
-            return obs, 0.0, True, True, info
+            return obs, -500.0, True, True, info
 
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2.

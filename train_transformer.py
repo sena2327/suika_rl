@@ -4,8 +4,8 @@ PPO training with Transformer extractor over board-fruit tokens.
 Token spec per fruit:
   [x, y, radius, mass, fruit_type_one_hot]
 
-Notes:
-  - Max board tokens = 30 (padded with mask)
+    Notes:
+      - Max board tokens = 40 (padded with mask)
   - CLS token output is fed to PPO policy/value heads
   - Transformer uses residual connections internally
 """
@@ -112,18 +112,50 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
         }
 
 
+class GameOverEnforcerWrapper(gym.Wrapper):
+    """Training-time safety net: enforce terminal semantics on episode end."""
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        ended = bool(terminated or truncated)
+        if ended:
+            # If JS already says LOSE/end UI, always treat as terminated.
+            js_lose = False
+            base = getattr(self.env, "unwrapped", self.env)
+            driver = getattr(base, "driver", None)
+            if driver is not None:
+                try:
+                    js_state, end_visible = driver.execute_script(
+                        """
+                        return [
+                            Number.isFinite(window.Game?.stateIndex) ? window.Game.stateIndex : null,
+                            getComputedStyle(document.getElementById('game-end-container')).display !== 'none'
+                        ];
+                        """
+                    )
+                    js_lose = (js_state == 3) or bool(end_visible)
+                except Exception:
+                    js_lose = False
+            if js_lose:
+                terminated = True
+            # Always apply negative terminal penalty on ended transitions.
+            reward = min(float(reward), -500.0)
+        return obs, float(reward), bool(terminated), bool(truncated), info
+
+
 class SuikaTransformerExtractor(BaseFeaturesExtractor):
     """
     Transformer extractor:
       - d_model=64
       - nhead=4
       - ff_dim=128
-      - max tokens=30 + CLS
+      - max tokens=40 + CLS
     """
 
     def __init__(self, observation_space: spaces.Dict):
         super().__init__(observation_space, features_dim=64)
-        self.max_board_tokens = 30
+        self.max_board_tokens = int(observation_space["board_fruit_mask"].shape[0])
         self.d_model = 64
         self.num_fruit_types = int(observation_space["board_fruit_type"].high.max()) + 1
 
@@ -132,7 +164,7 @@ class SuikaTransformerExtractor(BaseFeaturesExtractor):
         self.token_proj = nn.Linear(self.token_input_dim, self.d_model)
 
         self.cls_token = nn.Parameter(th.zeros(1, 1, self.d_model))
-        self.total_tokens = 2 + self.max_board_tokens  # current + next + board(30)
+        self.total_tokens = 2 + self.max_board_tokens  # current + next + board(max_tokens)
         self.pos_embed = nn.Parameter(th.zeros(1, self.total_tokens + 1, self.d_model))
 
         layer = nn.TransformerEncoderLayer(
@@ -233,6 +265,7 @@ def make_env(
             ready_timeout=2.0,
             enable_image_observation=False,
         )
+        env = GameOverEnforcerWrapper(env)
         env = SuikaTransformerObsWrapper(env)
         env.reset(seed=seed + rank)
         return env
@@ -332,7 +365,7 @@ def main():
             "d_model": 64,
             "n_heads": 4,
             "ff_dim": 128,
-            "max_tokens": 30,
+            "max_tokens": 40,
         },
         sync_tensorboard=True,
         monitor_gym=False,
