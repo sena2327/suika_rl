@@ -231,6 +231,7 @@ def make_env(
             wait_for_ready_on_step=True,
             ready_poll_interval=0.02,
             ready_timeout=2.0,
+            enable_image_observation=False,
         )
         env = SuikaTransformerObsWrapper(env)
         env.reset(seed=seed + rank)

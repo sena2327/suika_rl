@@ -31,6 +31,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         ready_timeout=2.0,
         img_width=128,
         img_height=128,
+        enable_image_observation=True,
     ) -> None:
         self.game_url = f"http://localhost:{port}/"
         # Check if port is already in use
@@ -62,6 +63,8 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.ready_timeout = ready_timeout
         self.img_width = int(img_width)
         self.img_height = int(img_height)
+        self.enable_image_observation = bool(enable_image_observation)
+        self._blank_image = np.zeros((self.img_height, self.img_width, 4), dtype=np.uint8)
         self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
@@ -141,7 +144,10 @@ class SuikaBrowserEnv(gymnasium.Env):
         """)
     
     def _get_obs_and_status(self):
-        img = self._capture_canvas()
+        if self.enable_image_observation:
+            img = self._capture_canvas()
+        else:
+            img = self._blank_image
         snapshot = self._query_game_snapshot()
         return dict(
             image=img,
