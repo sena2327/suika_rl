@@ -244,7 +244,7 @@ def parse_args():
     p.add_argument("--total-timesteps", type=int, default=200_000)
     p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--n-steps", type=int, default=128)
-    p.add_argument("--rollout-steps-total", type=int, default=4096)
+    p.add_argument("--rollout-steps-total", type=int, default=2048)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--headless", action="store_true", default=True)
@@ -264,7 +264,7 @@ def parse_args():
     p.add_argument(
         "--gif-eval-steps",
         type=int,
-        default=400,
+        default=0,
         help="Safety cap for policy steps per GIF episode (0 disables cap).",
     )
     p.add_argument("--gif-fps", type=int, default=20, help="GIF playback FPS.")
@@ -353,7 +353,7 @@ def main():
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.05,
+            ent_coef=0.10,
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log=str(tb_dir),
