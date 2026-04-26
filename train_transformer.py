@@ -244,7 +244,7 @@ def parse_args():
     p.add_argument("--total-timesteps", type=int, default=200_000)
     p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--n-steps", type=int, default=128)
-    p.add_argument("--rollout-steps-total", type=int, default=2048)
+    p.add_argument("--rollout-steps-total", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--headless", action="store_true", default=True)
