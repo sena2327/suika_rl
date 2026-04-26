@@ -337,7 +337,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             info['score'] = score
             reward = score - self.score
             if terminal:
-                reward = -1000.0
+                reward = -500.0
             self.score = score
 
             return obs, reward, terminal, truncated, info
