@@ -31,6 +31,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from wandb.integration.sb3 import WandbCallback
 
 import suika_env  # noqa: F401
+import suika_env_node  # noqa: F401
 from policy_gif_callback import PolicyGifCallback
 from train import (
     ActionStatsLoggingCallback,
@@ -115,6 +116,10 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
 class GameOverEnforcerWrapper(gym.Wrapper):
     """Training-time safety net: enforce terminal semantics on episode end."""
 
+    def __init__(self, env: gym.Env, terminal_penalty: float = -500.0):
+        super().__init__(env)
+        self.terminal_penalty = float(terminal_penalty)
+
     def step(self, action):
         obs, reward, terminated, truncated, info = self.env.step(action)
         info = dict(info)
@@ -139,8 +144,8 @@ class GameOverEnforcerWrapper(gym.Wrapper):
                     js_lose = False
             if js_lose:
                 terminated = True
-            # Always apply negative terminal penalty on ended transitions.
-            reward = min(float(reward), -500.0)
+            # Always apply fixed terminal penalty on ended transitions.
+            reward = self.terminal_penalty
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
@@ -248,14 +253,16 @@ class SuikaTransformerExtractor(BaseFeaturesExtractor):
 
 
 def make_env(
+    env_id: str,
     rank: int,
     seed: int,
     headless: bool,
     port_base: int,
+    terminal_penalty: float,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env = gym.make(
-            "SuikaEnv-v0",
+            env_id,
             headless=headless,
             delay_before_img_capture=0.0,
             port=port_base + rank,
@@ -265,7 +272,9 @@ def make_env(
             ready_timeout=2.0,
             enable_image_observation=False,
         )
-        env = GameOverEnforcerWrapper(env)
+        env = GameOverEnforcerWrapper(env, terminal_penalty=terminal_penalty)
+        # Per-environment reward normalization (independent running stats in each worker).
+        env = gym.wrappers.NormalizeReward(env, gamma=0.99)
         env = SuikaTransformerObsWrapper(env)
         env.reset(seed=seed + rank)
         return env
@@ -276,7 +285,14 @@ def make_env(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
-    p.add_argument("--n-envs", type=int, default=8)
+    p.add_argument(
+        "--env-id",
+        type=str,
+        default="SuikaEnv-v0",
+        choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
+        help="Training env id.",
+    )
+    p.add_argument("--n-envs", type=int, default=16)
     p.add_argument("--n-steps", type=int, default=128)
     p.add_argument("--rollout-steps-total", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
@@ -306,6 +322,7 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--terminal-penalty", type=float, default=-500.0)
     return p.parse_args()
 
 
@@ -329,7 +346,17 @@ def main():
     tb_dir = Path("runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
 
-    env_fns = [make_env(i, args.seed, args.headless, args.port_base) for i in range(args.n_envs)]
+    env_fns = [
+        make_env(
+            args.env_id,
+            i,
+            args.seed,
+            args.headless,
+            args.port_base,
+            args.terminal_penalty,
+        )
+        for i in range(args.n_envs)
+    ]
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
@@ -340,7 +367,7 @@ def main():
         config={
             "algo": "PPO",
             "extractor": "Transformer",
-            "env_id": "SuikaEnv-v0",
+            "env_id": args.env_id,
             "total_timesteps": args.total_timesteps,
             "n_envs": args.n_envs,
             "seed": args.seed,
@@ -349,10 +376,11 @@ def main():
             "n_steps": effective_n_steps,
             "rollout_steps_total": effective_rollout_total,
             "batch_size": args.batch_size,
+            "terminal_penalty": args.terminal_penalty,
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_range": 0.2,
-            "ent_coef": 0.01,
+            "ent_coef": 0.05,
             "vf_coef": 0.5,
             "max_grad_norm": 0.5,
             "device": args.device,
@@ -417,11 +445,12 @@ def main():
                     seed=args.seed,
                     headless=args.headless,
                     port_base=args.port_base,
+                    env_id=args.env_id,
                     total_timesteps=args.total_timesteps,
                     verbose=1,
                 )
             )
-        if args.restart_browser_every_steps > 0:
+        if args.restart_browser_every_steps > 0 and args.env_id != "SuikaEnvNode-v0":
             callbacks.append(
                 BrowserRestartCallback(
                     every_steps=args.restart_browser_every_steps,

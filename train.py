@@ -1,5 +1,5 @@
 """
-PPO training draft for SuikaEnv-v0.
+PPO training (CNN image input) for SuikaEnv-v0 / SuikaEnvNode-v0.
 
 Requirements:
   uv pip install stable-baselines3 torch wandb
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
+from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -32,6 +33,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv, VecMoni
 from wandb.integration.sb3 import WandbCallback
 
 import suika_env  # noqa: F401  # Registers "SuikaEnv-v0"
+import suika_env_node  # noqa: F401  # Registers "SuikaEnvNode-v0"
 from policy_gif_callback import PolicyGifCallback
 
 
@@ -44,162 +46,102 @@ def restore_terminal_cursor():
             pass
 
 
-class SuikaObsWrapper(gym.ObservationWrapper):
-    """Use feature-only observation for policy input (no image)."""
+class SuikaImageObsWrapper(gym.ObservationWrapper):
+    """Use image-only observation for CNN policy input."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        fruit_type_space = env.observation_space["current_fruit_type"]
-        next_fruit_type_space = env.observation_space["next_fruit_type"]
-        fruit_x_space = env.observation_space["current_fruit_x"]
-        stage_top10_xy_space = env.observation_space["stage_top10_xy"]
-        top10_fruit_types_space = env.observation_space["top10_fruit_types"]
-        top10_mask_space = env.observation_space["top10_mask"]
-        max_height_space = env.observation_space["max_height"]
-        danger_count_space = env.observation_space["danger_count"]
-        largest_fruit_type_space = env.observation_space["largest_fruit_type"]
-        fruit_count_space = env.observation_space["fruit_count"]
+        image_space = env.observation_space["image"]
         self.observation_space = spaces.Dict(
             {
-                "current_fruit_type": spaces.Box(
-                    low=fruit_type_space.low.astype(np.float32),
-                    high=fruit_type_space.high.astype(np.float32),
-                    shape=fruit_type_space.shape,
-                    dtype=np.float32,
-                ),
-                "next_fruit_type": spaces.Box(
-                    low=next_fruit_type_space.low.astype(np.float32),
-                    high=next_fruit_type_space.high.astype(np.float32),
-                    shape=next_fruit_type_space.shape,
-                    dtype=np.float32,
-                ),
-                "current_fruit_x": spaces.Box(
-                    low=fruit_x_space.low.astype(np.float32),
-                    high=fruit_x_space.high.astype(np.float32),
-                    shape=fruit_x_space.shape,
-                    dtype=np.float32,
-                ),
-                "stage_top10_xy": spaces.Box(
-                    low=stage_top10_xy_space.low.astype(np.float32),
-                    high=stage_top10_xy_space.high.astype(np.float32),
-                    shape=stage_top10_xy_space.shape,
-                    dtype=np.float32,
-                ),
-                "top10_fruit_types": spaces.Box(
-                    low=top10_fruit_types_space.low.astype(np.float32),
-                    high=top10_fruit_types_space.high.astype(np.float32),
-                    shape=top10_fruit_types_space.shape,
-                    dtype=np.float32,
-                ),
-                "top10_mask": spaces.Box(
-                    low=top10_mask_space.low.astype(np.float32),
-                    high=top10_mask_space.high.astype(np.float32),
-                    shape=top10_mask_space.shape,
-                    dtype=np.float32,
-                ),
-                "max_height": spaces.Box(
-                    low=max_height_space.low.astype(np.float32),
-                    high=max_height_space.high.astype(np.float32),
-                    shape=max_height_space.shape,
-                    dtype=np.float32,
-                ),
-                "danger_count": spaces.Box(
-                    low=danger_count_space.low.astype(np.float32),
-                    high=danger_count_space.high.astype(np.float32),
-                    shape=danger_count_space.shape,
-                    dtype=np.float32,
-                ),
-                "largest_fruit_type": spaces.Box(
-                    low=largest_fruit_type_space.low.astype(np.float32),
-                    high=largest_fruit_type_space.high.astype(np.float32),
-                    shape=largest_fruit_type_space.shape,
-                    dtype=np.float32,
-                ),
-                "fruit_count": spaces.Box(
-                    low=fruit_count_space.low.astype(np.float32),
-                    high=fruit_count_space.high.astype(np.float32),
-                    shape=fruit_count_space.shape,
-                    dtype=np.float32,
-                ),
+                "image": spaces.Box(
+                    low=image_space.low.astype(np.uint8),
+                    high=image_space.high.astype(np.uint8),
+                    shape=image_space.shape,
+                    dtype=np.uint8,
+                )
             }
         )
 
     def observation(self, observation):
-        fruit_type = observation["current_fruit_type"].astype(np.float32, copy=False)
-        next_fruit_type = observation["next_fruit_type"].astype(np.float32, copy=False)
-        fruit_x = observation["current_fruit_x"].astype(np.float32, copy=False)
-        stage_top10_xy = observation["stage_top10_xy"].astype(np.float32, copy=False)
-        top10_fruit_types = observation["top10_fruit_types"].astype(np.float32, copy=False)
-        top10_mask = observation["top10_mask"].astype(np.float32, copy=False)
-        max_height = observation["max_height"].astype(np.float32, copy=False)
-        danger_count = observation["danger_count"].astype(np.float32, copy=False)
-        largest_fruit_type = observation["largest_fruit_type"].astype(np.float32, copy=False)
-        fruit_count = observation["fruit_count"].astype(np.float32, copy=False)
-        return {
-            "current_fruit_type": fruit_type,
-            "next_fruit_type": next_fruit_type,
-            "current_fruit_x": fruit_x,
-            "stage_top10_xy": stage_top10_xy,
-            "top10_fruit_types": top10_fruit_types,
-            "top10_mask": top10_mask,
-            "max_height": max_height,
-            "danger_count": danger_count,
-            "largest_fruit_type": largest_fruit_type,
-            "fruit_count": fruit_count,
-        }
+        return {"image": observation["image"]}
 
 
-class SuikaCombinedExtractor(BaseFeaturesExtractor):
-    """Feature-only extractor (no image)."""
+class SuikaImageFrameStackWrapper(gym.Wrapper):
+    """Stack the latest N image frames along channel axis (H, W, C*N)."""
+
+    def __init__(self, env: gym.Env, n_frames: int = 3):
+        super().__init__(env)
+        self.n_frames = max(1, int(n_frames))
+        base_img_space = env.observation_space["image"]
+        h, w, c = base_img_space.shape
+        self._frames = deque(maxlen=self.n_frames)
+        self.observation_space = spaces.Dict(
+            {
+                "image": spaces.Box(
+                    low=0,
+                    high=255,
+                    shape=(h, w, c * self.n_frames),
+                    dtype=np.uint8,
+                )
+            }
+        )
+
+    def _stacked_obs(self):
+        stacked = np.concatenate(list(self._frames), axis=2)
+        return {"image": stacked}
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        img = obs["image"]
+        self._frames.clear()
+        for _ in range(self.n_frames):
+            self._frames.append(img.copy())
+        return self._stacked_obs(), info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        self._frames.append(obs["image"].copy())
+        return self._stacked_obs(), reward, terminated, truncated, info
+
+
+class SuikaImageCnnExtractor(BaseFeaturesExtractor):
+    """CNN extractor for image-only dict observation."""
 
     def __init__(self, observation_space: spaces.Dict):
-        super().__init__(observation_space, features_dim=1)
-
-        num_fruit_types = int(observation_space["current_fruit_type"].high[0]) + 1
-        self.current_fruit_embedding = nn.Embedding(num_fruit_types, 8)
-        self.next_fruit_embedding = nn.Embedding(num_fruit_types, 8)
-        self.largest_fruit_embedding = nn.Embedding(num_fruit_types, 4)
-        self.top10_fruit_embedding = nn.Embedding(num_fruit_types, 4)
-        self.num_fruit_types = num_fruit_types
-        # 8(current type emb) + 8(next type emb) + 4(largest type emb)
-        # + 40(top10 type emb with mask) + 1(current x) + 20(top10 xy) + 10(top10 mask)
-        # + 1(max height) + 1(danger count) + 1(fruit count) = 94
-        self.aux_head = nn.Sequential(nn.Linear(94, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU())
-        self._features_dim = 64
+        super().__init__(observation_space, features_dim=256)
+        image_space = observation_space["image"]
+        if len(image_space.shape) != 3:
+            raise ValueError(f"Expected 3D image space, got shape={image_space.shape}")
+        # Support both HWC and CHW inputs.
+        shp = tuple(int(v) for v in image_space.shape)
+        self._channels_first = shp[0] <= 16 and shp[1] > 16 and shp[2] > 16
+        if self._channels_first:
+            c = int(shp[0])
+        else:
+            c = int(shp[2])
+        self.cnn = nn.Sequential(
+            nn.Conv2d(c, 32, kernel_size=8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+        with th.no_grad():
+            sample = th.as_tensor(image_space.sample()[None]).float()
+            if not self._channels_first:
+                sample = sample.permute(0, 3, 1, 2).contiguous()
+            n_flatten = int(self.cnn(sample).shape[1])
+        self.linear = nn.Sequential(nn.Linear(n_flatten, 256), nn.ReLU())
+        self._features_dim = 256
 
     def forward(self, observations):
-        fruit_x = observations["current_fruit_x"].float()
-        stage_top10_xy = observations["stage_top10_xy"].float()
-        top10_fruit_types = observations["top10_fruit_types"].long().clamp(0, self.num_fruit_types - 1)
-        top10_mask = observations["top10_mask"].float()
-        max_height = observations["max_height"].float()
-        danger_count = observations["danger_count"].float() / 10.0
-        fruit_count = observations["fruit_count"].float() / 50.0
-        fruit_type_idx = observations["current_fruit_type"].long().squeeze(1)
-        next_fruit_type_idx = observations["next_fruit_type"].long().squeeze(1)
-        largest_fruit_type_idx = observations["largest_fruit_type"].long().squeeze(1)
-        fruit_type_emb = self.current_fruit_embedding(fruit_type_idx)
-        next_fruit_emb = self.next_fruit_embedding(next_fruit_type_idx)
-        largest_fruit_emb = self.largest_fruit_embedding(largest_fruit_type_idx)
-        top10_type_emb = self.top10_fruit_embedding(top10_fruit_types)
-        top10_type_emb = top10_type_emb * top10_mask.unsqueeze(-1)
-        top10_type_emb = top10_type_emb.flatten(start_dim=1)
-        aux = th.cat(
-            [
-                fruit_type_emb,
-                next_fruit_emb,
-                largest_fruit_emb,
-                top10_type_emb,
-                fruit_x,
-                stage_top10_xy,
-                top10_mask,
-                max_height,
-                danger_count,
-                fruit_count,
-            ],
-            dim=1,
-        )
-        return self.aux_head(aux)
+        image = observations["image"].float() / 255.0
+        if not self._channels_first:
+            image = image.permute(0, 3, 1, 2).contiguous()
+        return self.linear(self.cnn(image))
 
 
 class BrowserRestartCallback(BaseCallback):
@@ -249,6 +191,7 @@ class FinalScoreLoggingCallback(BaseCallback):
 
     def __init__(self, verbose: int = 0):
         super().__init__(verbose=verbose)
+        self._last_final_score_mean: float | None = None
 
     def _on_step(self) -> bool:
         dones = self.locals.get("dones", None)
@@ -257,26 +200,37 @@ class FinalScoreLoggingCallback(BaseCallback):
             return True
 
         final_scores = []
+        # SubprocVecEnv may provide terminal-only info under "final_info".
+        # Prefer terminal score when available.
         for i, done in enumerate(np.asarray(dones).tolist()):
             if not done:
                 continue
             info = infos[i] if i < len(infos) else {}
-            score = info.get("score", None)
+            term_info = info.get("final_info", info)
+            score = term_info.get("score", info.get("score", None))
             if score is None:
                 continue
             score_f = float(score)
+            if not np.isfinite(score_f):
+                continue
             final_scores.append(score_f)
             # Aggregate done-episode scores within current SB3 log window.
             self.logger.record_mean("rollout/final_score", score_f)
 
         if final_scores:
             mean_score = float(np.mean(final_scores))
+            self._last_final_score_mean = mean_score
             self.logger.record("rollout/final_score_mean", mean_score)
-            if self.verbose > 0:
-                print(
-                    f"[FinalScoreLoggingCallback] step={self.num_timesteps} "
-                    f"final_score_mean={mean_score:.2f} n={len(final_scores)}"
-                )
+        else:
+            # Keep the latest valid value when no episode ended in this step window.
+            if self._last_final_score_mean is not None:
+                self.logger.record("rollout/final_score_mean", self._last_final_score_mean)
+        if final_scores and self.verbose > 0:
+            mean_score = float(np.mean(final_scores))
+            print(
+                f"[FinalScoreLoggingCallback] step={self.num_timesteps} "
+                f"final_score_mean={mean_score:.2f} n={len(final_scores)}"
+            )
         return True
 
 
@@ -299,14 +253,67 @@ class ActionStatsLoggingCallback(BaseCallback):
         if arr.ndim == 1:
             x = arr.astype(np.float32)
         else:
-            # Continuous 1D action space: first column is x in [0, 1].
             x = arr[:, 0].astype(np.float32)
+        # For centered action-space envs, clamp for interpretable rollout stats.
+        x = np.clip(x, -0.5, 0.5)
 
         x_mean = float(np.mean(x))
         x_var = float(np.var(x))
         # Mean over callback calls within rollout/log window.
         self.logger.record_mean("rollout/action_x_mean", x_mean)
         self.logger.record_mean("rollout/action_x_var", x_var)
+        return True
+
+
+class LoseHeightDebugLoggingCallback(BaseCallback):
+    """Log LOSE-height trigger diagnostics from env info."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", None)
+        dones = self.locals.get("dones", None)
+        if infos is None:
+            return True
+
+        lose_hits = []
+        collision_pairs = []
+        triggered = []
+        ay_values = []
+        by_values = []
+
+        dones_arr = np.asarray(dones).tolist() if dones is not None else [False] * len(infos)
+        for i, info in enumerate(infos):
+            step_pairs = info.get("collision_pairs_step", None)
+            step_hits = info.get("lose_height_hits_step", None)
+            step_trig = info.get("lose_height_triggered", None)
+            if step_pairs is not None:
+                collision_pairs.append(float(step_pairs))
+            if step_hits is not None:
+                lose_hits.append(float(step_hits))
+            if step_trig is not None:
+                triggered.append(float(step_trig))
+
+            if i < len(dones_arr) and dones_arr[i]:
+                term_info = info.get("final_info", info)
+                lose_event = term_info.get("lose_event", None)
+                if isinstance(lose_event, dict):
+                    if "aY" in lose_event:
+                        ay_values.append(float(lose_event["aY"]))
+                    if "bY" in lose_event:
+                        by_values.append(float(lose_event["bY"]))
+
+        if collision_pairs:
+            self.logger.record_mean("rollout/collision_pairs_step", float(np.mean(collision_pairs)))
+        if lose_hits:
+            self.logger.record_mean("rollout/lose_height_hits_step", float(np.mean(lose_hits)))
+        if triggered:
+            self.logger.record_mean("rollout/lose_height_trigger_rate", float(np.mean(triggered)))
+        if ay_values:
+            self.logger.record_mean("rollout/lose_event_aY", float(np.mean(ay_values)))
+        if by_values:
+            self.logger.record_mean("rollout/lose_event_bY", float(np.mean(by_values)))
         return True
 
 
@@ -339,19 +346,26 @@ def make_env(
     headless: bool,
     delay: float,
     port_base: int,
+    env_id: str,
+    image_frame_stack: int,
+    reward_norm_gamma: float,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
-        env = gym.make(
-            "SuikaEnv-v0",
+        env_kwargs = dict(
             headless=headless,
             delay_before_img_capture=0.0,
-            port=port_base + rank,
             mute_sound=True,
             wait_for_ready_on_step=True,
             ready_poll_interval=0.02,
             ready_timeout=2.0,
+            enable_image_observation=True,
         )
-        env = SuikaObsWrapper(env)
+        if env_id == "SuikaEnv-v0":
+            env_kwargs["port"] = port_base + rank
+        env = gym.make(env_id, **env_kwargs)
+        env = SuikaImageObsWrapper(env)
+        env = SuikaImageFrameStackWrapper(env, n_frames=image_frame_stack)
+        env = gym.wrappers.NormalizeReward(env, gamma=reward_norm_gamma)
         return env
 
     return _init
@@ -360,7 +374,7 @@ def make_env(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
-    p.add_argument("--n-envs", type=int, default=2)
+    p.add_argument("--n-envs", type=int, default=16)
     p.add_argument(
         "--n-steps",
         type=int,
@@ -377,6 +391,25 @@ def parse_args():
         ),
     )
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--image-frame-stack",
+        type=int,
+        default=3,
+        help="Number of stacked image frames for CNN input.",
+    )
+    p.add_argument(
+        "--reward-norm-gamma",
+        type=float,
+        default=0.99,
+        help="Gamma for reward normalization wrapper.",
+    )
+    p.add_argument(
+        "--env-id",
+        type=str,
+        default="SuikaEnv-v0",
+        choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
+        help="Environment id for training backend.",
+    )
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
@@ -406,7 +439,7 @@ def parse_args():
     p.add_argument(
         "--gif-eval-steps",
         type=int,
-        default=400,
+        default=10000,
         help="Safety cap for policy steps per GIF episode (0 disables cap).",
     )
     p.add_argument(
@@ -458,6 +491,9 @@ def main():
             args.headless,
             args.delay_before_img_capture,
             args.port_base,
+            args.env_id,
+            args.image_frame_stack,
+            args.reward_norm_gamma,
         )
         for i in range(args.n_envs)
     ]
@@ -470,10 +506,12 @@ def main():
         name=run_name,
         config={
             "algo": "PPO",
-            "env_id": "SuikaEnv-v0",
+            "env_id": args.env_id,
             "total_timesteps": args.total_timesteps,
             "n_envs": args.n_envs,
             "seed": args.seed,
+            "image_frame_stack": args.image_frame_stack,
+            "reward_norm_gamma": args.reward_norm_gamma,
             "delay_before_img_capture": args.delay_before_img_capture,
             "headless": args.headless,
             "learning_rate": 3e-4,
@@ -501,7 +539,7 @@ def main():
 
     interrupted = False
     try:
-        policy_kwargs = dict(features_extractor_class=SuikaCombinedExtractor)
+        policy_kwargs = dict(features_extractor_class=SuikaImageCnnExtractor)
         model = PPO(
             "MultiInputPolicy",
             vec_env,
@@ -542,11 +580,12 @@ def main():
                     seed=args.seed,
                     headless=args.headless,
                     port_base=args.port_base,
+                    env_id=args.env_id,
                     total_timesteps=args.total_timesteps,
                     verbose=1,
                 )
             )
-        if args.restart_browser_every_steps > 0:
+        if args.env_id == "SuikaEnv-v0" and args.restart_browser_every_steps > 0:
             callbacks.append(
                 BrowserRestartCallback(
                     every_steps=args.restart_browser_every_steps,

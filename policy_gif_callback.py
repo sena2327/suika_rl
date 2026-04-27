@@ -11,6 +11,7 @@ from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import obs_as_tensor
 
 import suika_env  # noqa: F401
+import suika_env_node  # noqa: F401
 
 
 def _obs_to_hwc(raw_env):
@@ -53,6 +54,7 @@ def _generate_policy_gif_worker(
     seed: int,
     headless: bool,
     port_base: int,
+    env_id: str,
 ):
     try:
         model = PPO.load(model_path, device="cpu")
@@ -61,8 +63,7 @@ def _generate_policy_gif_worker(
 
         def make_eval_env(rank: int):
             port = port_base + 1000 + rank
-            env = gym.make(
-                "SuikaEnv-v0",
+            env_kwargs = dict(
                 headless=headless,
                 delay_before_img_capture=0.0,
                 port=port,
@@ -70,6 +71,14 @@ def _generate_policy_gif_worker(
                 wait_for_ready_on_step=True,
                 ready_poll_interval=0.02,
                 ready_timeout=2.0,
+            )
+            # For node env, enable GUI only during GIF generation.
+            if env_id == "SuikaEnvNode-v0":
+                env_kwargs["gui"] = True
+                env_kwargs["gui_fps"] = float(max(1, fps))
+            env = gym.make(
+                env_id,
+                **env_kwargs,
             )
             return env
 
@@ -155,6 +164,7 @@ class PolicyGifCallback(BaseCallback):
         seed: int,
         headless: bool,
         port_base: int,
+        env_id: str = "SuikaEnv-v0",
         total_timesteps: int | None = None,
         verbose: int = 0,
     ):
@@ -166,6 +176,7 @@ class PolicyGifCallback(BaseCallback):
         self.seed = int(seed)
         self.headless = bool(headless)
         self.port_base = int(port_base)
+        self.env_id = str(env_id)
         self.total_timesteps_target = int(total_timesteps) if total_timesteps is not None else None
         self._last_export_at = 0
         self._export_idx = 0
@@ -198,6 +209,7 @@ class PolicyGifCallback(BaseCallback):
                 self.seed,
                 self.headless,
                 self.port_base,
+                self.env_id,
             ),
             daemon=False,
         )
