@@ -406,7 +406,7 @@ def parse_args():
     p.add_argument(
         "--env-id",
         type=str,
-        default="SuikaEnv-v0",
+        default="SuikaEnvNode-v0",
         choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
         help="Environment id for training backend.",
     )
