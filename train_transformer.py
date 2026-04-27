@@ -299,7 +299,7 @@ def parse_args():
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
-    p.add_argument("--save-path", type=Path, default=Path("models/ppo_suika_transformer"))
+    p.add_argument("--save-path", type=Path, default=Path("models/transformer/ppo_suika_transformer"))
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
@@ -318,7 +318,7 @@ def parse_args():
         help="Safety cap for policy steps per GIF episode (0 disables cap).",
     )
     p.add_argument("--gif-fps", type=int, default=20, help="GIF playback FPS.")
-    p.add_argument("--gif-dir", type=Path, default=Path("gifs"))
+    p.add_argument("--gif-dir", type=Path, default=Path("gifs/transformer"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)

@@ -414,7 +414,7 @@ def parse_args():
     p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
-    p.add_argument("--save-path", type=Path, default=Path("models/ppo_suika"))
+    p.add_argument("--save-path", type=Path, default=Path("models/cnn/ppo_suika"))
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
@@ -451,7 +451,7 @@ def parse_args():
     p.add_argument(
         "--gif-dir",
         type=Path,
-        default=Path("gifs"),
+        default=Path("gifs/cnn"),
         help="Directory for periodic policy GIFs.",
     )
     p.add_argument("--device", type=str, default="cuda", help="SB3 device, e.g. auto|cpu|cuda")
