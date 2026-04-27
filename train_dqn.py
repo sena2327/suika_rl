@@ -305,22 +305,32 @@ def parse_args():
 
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--buffer-size", type=int, default=50_000)
-    p.add_argument("--learning-starts", type=int, default=10_000)
+    p.add_argument("--learning-starts", type=int, default=20_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--target-update-interval", type=int, default=1000)
     p.add_argument("--train-freq", type=int, default=64)
     p.add_argument("--gradient-steps", type=int, default=1)
-    p.add_argument("--exploration-fraction", type=float, default=0.01)
+    p.add_argument("--exploration-fraction", type=float, default=0.3)
     p.add_argument("--exploration-initial-eps", type=float, default=1.0)
-    p.add_argument("--exploration-final-eps", type=float, default=0.02)
+    p.add_argument("--exploration-final-eps", type=float, default=0.05)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
     actual_device = resolve_device(args.device)
+    effective_target_update_interval = int(args.target_update_interval)
+    if args.tau > 0.0:
+        # In SB3 DQN, target updates happen every `target_update_interval`.
+        # Force interval=1 so tau>0 performs soft updates at every env step.
+        effective_target_update_interval = 1
+        if args.target_update_interval != 1:
+            print(
+                "[train_dqn] tau>0 detected: forcing target_update_interval=1 "
+                "for per-step soft target updates."
+            )
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
@@ -368,7 +378,7 @@ def main():
                 "batch_size": args.batch_size,
                 "gamma": args.gamma,
                 "tau": args.tau,
-                "target_update_interval": args.target_update_interval,
+                "target_update_interval": effective_target_update_interval,
                 "train_freq": args.train_freq,
                 "gradient_steps": args.gradient_steps,
                 "exploration_fraction": args.exploration_fraction,
@@ -402,7 +412,7 @@ def main():
             tau=args.tau,
             train_freq=(args.train_freq, "step"),
             gradient_steps=args.gradient_steps,
-            target_update_interval=args.target_update_interval,
+            target_update_interval=effective_target_update_interval,
             exploration_fraction=args.exploration_fraction,
             exploration_initial_eps=args.exploration_initial_eps,
             exploration_final_eps=args.exploration_final_eps,
