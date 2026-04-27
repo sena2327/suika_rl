@@ -507,6 +507,7 @@ def main():
         f"rollout_total={effective_rollout_total}"
     )
 
+    wandb_enabled = bool(args.wandb_run_name)
     run_name = args.wandb_run_name or f"ppo-suika-seed{args.seed}"
     tb_dir = Path("runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -527,42 +528,44 @@ def main():
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
-    run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=run_name,
-        config={
-            "algo": "PPO",
-            "env_id": args.env_id,
-            "total_timesteps": args.total_timesteps,
-            "n_envs": args.n_envs,
-            "seed": args.seed,
-            "image_frame_stack": args.image_frame_stack,
-            "reward_norm_gamma": args.reward_norm_gamma,
-            "delay_before_img_capture": args.delay_before_img_capture,
-            "headless": args.headless,
-            "learning_rate": 3e-4,
-            "n_steps": effective_n_steps,
-            "rollout_steps_total": effective_rollout_total,
-            "batch_size": 256,
-            "gamma": 0.99,
-            "gae_lambda": 0.95,
-            "clip_range": 0.2,
-            "ent_coef": 0.01,
-            "vf_coef": 0.5,
-            "max_grad_norm": 0.5,
-            "device": actual_device,
-            "gpu_id": args.gpu_id,
-            "save_every_steps": args.save_every_steps,
-            "restart_browser_every_steps": args.restart_browser_every_steps,
-            "gif_eval_every_steps": args.gif_eval_every_steps,
-            "gif_eval_steps": args.gif_eval_steps,
-            "gif_fps": args.gif_fps,
-        },
-        sync_tensorboard=True,
-        monitor_gym=False,
-        save_code=True,
-    )
+    run = None
+    if wandb_enabled:
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config={
+                "algo": "PPO",
+                "env_id": args.env_id,
+                "total_timesteps": args.total_timesteps,
+                "n_envs": args.n_envs,
+                "seed": args.seed,
+                "image_frame_stack": args.image_frame_stack,
+                "reward_norm_gamma": args.reward_norm_gamma,
+                "delay_before_img_capture": args.delay_before_img_capture,
+                "headless": args.headless,
+                "learning_rate": 3e-4,
+                "n_steps": effective_n_steps,
+                "rollout_steps_total": effective_rollout_total,
+                "batch_size": 256,
+                "gamma": 0.99,
+                "gae_lambda": 0.95,
+                "clip_range": 0.2,
+                "ent_coef": 0.01,
+                "vf_coef": 0.5,
+                "max_grad_norm": 0.5,
+                "device": actual_device,
+                "gpu_id": args.gpu_id,
+                "save_every_steps": args.save_every_steps,
+                "restart_browser_every_steps": args.restart_browser_every_steps,
+                "gif_eval_every_steps": args.gif_eval_every_steps,
+                "gif_eval_steps": args.gif_eval_steps,
+                "gif_fps": args.gif_fps,
+            },
+            sync_tensorboard=True,
+            monitor_gym=False,
+            save_code=True,
+        )
 
     interrupted = False
     try:
@@ -586,14 +589,16 @@ def main():
             device=actual_device,
         )
 
-        save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
-        wandb_callback = WandbCallback(
-            gradient_save_freq=0,
-            model_save_path=str(args.save_path.parent / "wandb_checkpoints"),
-            model_save_freq=save_freq,
-            verbose=2,
-        )
-        callbacks = [wandb_callback]
+        callbacks = []
+        if wandb_enabled:
+            save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
+            wandb_callback = WandbCallback(
+                gradient_save_freq=0,
+                model_save_path=str(args.save_path.parent / "wandb_checkpoints"),
+                model_save_freq=save_freq,
+                verbose=2,
+            )
+            callbacks.append(wandb_callback)
         callbacks.append(FinalScoreLoggingCallback(verbose=0))
         callbacks.append(ActionStatsLoggingCallback(verbose=0))
         callbacks.append(PolicyStdLoggingCallback(verbose=0))
@@ -636,7 +641,8 @@ def main():
         restore_terminal_cursor()
     finally:
         vec_env.close()
-        run.finish()
+        if run is not None:
+            run.finish()
         restore_terminal_cursor()
     if not interrupted:
         print(f"Saved model to: {args.save_path}.zip")

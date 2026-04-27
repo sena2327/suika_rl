@@ -280,7 +280,7 @@ def parse_args():
     p.add_argument("--save-path", type=Path, default=Path("dqn/models/suika_dqn_node"))
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
-    p.add_argument("--wandb-run-name", type=str, default="dqn")
+    p.add_argument("--wandb-run-name", type=str, default=None)
     p.add_argument("--save-every-steps", type=int, default=20_000)
     p.add_argument(
         "--gif-eval-every-steps",
@@ -326,6 +326,7 @@ def main():
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
 
+    wandb_enabled = bool(args.wandb_run_name)
     run_name = args.wandb_run_name or f"dqn-suika-node-seed{args.seed}"
     tb_dir = Path("dqn/runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
@@ -346,43 +347,45 @@ def main():
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
-    run = wandb.init(
-        project=args.wandb_project,
-        entity=args.wandb_entity,
-        name=run_name,
-        config={
-            "algo": "DQN",
-            "env_id": "SuikaEnvNode-v0",
-            "total_timesteps": args.total_timesteps,
-            "n_envs": args.n_envs,
-            "seed": args.seed,
-            "image_frame_stack": args.image_frame_stack,
-            "reward_norm_gamma": args.reward_norm_gamma,
-            "dqn_action_bins": args.dqn_action_bins,
-            "learning_rate": args.learning_rate,
-            "buffer_size": args.buffer_size,
-            "learning_starts": args.learning_starts,
-            "batch_size": args.batch_size,
-            "gamma": args.gamma,
-            "tau": args.tau,
-            "target_update_interval": args.target_update_interval,
-            "train_freq": args.train_freq,
-            "gradient_steps": args.gradient_steps,
-            "exploration_fraction": args.exploration_fraction,
-            "exploration_initial_eps": args.exploration_initial_eps,
-            "exploration_final_eps": args.exploration_final_eps,
-            "device": actual_device,
-            "gpu_id": args.gpu_id,
-            "save_every_steps": args.save_every_steps,
-            "gif_eval_every_steps": args.gif_eval_every_steps,
-            "gif_eval_steps": args.gif_eval_steps,
-            "gif_fps": args.gif_fps,
-            "node_bin": args.node_bin,
-        },
-        sync_tensorboard=True,
-        monitor_gym=False,
-        save_code=True,
-    )
+    run = None
+    if wandb_enabled:
+        run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config={
+                "algo": "DQN",
+                "env_id": "SuikaEnvNode-v0",
+                "total_timesteps": args.total_timesteps,
+                "n_envs": args.n_envs,
+                "seed": args.seed,
+                "image_frame_stack": args.image_frame_stack,
+                "reward_norm_gamma": args.reward_norm_gamma,
+                "dqn_action_bins": args.dqn_action_bins,
+                "learning_rate": args.learning_rate,
+                "buffer_size": args.buffer_size,
+                "learning_starts": args.learning_starts,
+                "batch_size": args.batch_size,
+                "gamma": args.gamma,
+                "tau": args.tau,
+                "target_update_interval": args.target_update_interval,
+                "train_freq": args.train_freq,
+                "gradient_steps": args.gradient_steps,
+                "exploration_fraction": args.exploration_fraction,
+                "exploration_initial_eps": args.exploration_initial_eps,
+                "exploration_final_eps": args.exploration_final_eps,
+                "device": actual_device,
+                "gpu_id": args.gpu_id,
+                "save_every_steps": args.save_every_steps,
+                "gif_eval_every_steps": args.gif_eval_every_steps,
+                "gif_eval_steps": args.gif_eval_steps,
+                "gif_fps": args.gif_fps,
+                "node_bin": args.node_bin,
+            },
+            sync_tensorboard=True,
+            monitor_gym=False,
+            save_code=True,
+        )
 
     interrupted = False
     try:
@@ -409,15 +412,16 @@ def main():
             device=actual_device,
         )
 
-        save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
-        wandb_callback = WandbCallback(
-            gradient_save_freq=0,
-            model_save_path=str(Path("dqn/checkpoints/wandb")),
-            model_save_freq=save_freq,
-            verbose=2,
-        )
-
-        callbacks = [wandb_callback, FinalScoreLoggingCallback(verbose=0), ActionStatsLoggingCallback(verbose=0)]
+        callbacks = [FinalScoreLoggingCallback(verbose=0), ActionStatsLoggingCallback(verbose=0)]
+        if wandb_enabled:
+            save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
+            wandb_callback = WandbCallback(
+                gradient_save_freq=0,
+                model_save_path=str(Path("dqn/checkpoints/wandb")),
+                model_save_freq=save_freq,
+                verbose=2,
+            )
+            callbacks.insert(0, wandb_callback)
 
         if args.gif_eval_every_steps > 0:
             callbacks.append(
@@ -453,7 +457,8 @@ def main():
         restore_terminal_cursor()
     finally:
         vec_env.close()
-        run.finish()
+        if run is not None:
+            run.finish()
         restore_terminal_cursor()
 
     if not interrupted:
