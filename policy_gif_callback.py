@@ -7,7 +7,8 @@ from pathlib import Path
 import imageio.v2 as imageio
 import gymnasium as gym
 import numpy as np
-from stable_baselines3 import PPO
+from PIL import Image
+from stable_baselines3 import DQN, PPO
 from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.utils import obs_as_tensor
 
@@ -16,8 +17,10 @@ import suika_env_node  # noqa: F401
 
 
 def _obs_to_hwc(raw_env):
-    # Use raw canvas capture from underlying browser env through wrappers.
+    # Prefer full canvas capture (includes right side), fallback to cropped capture.
     base_env = getattr(raw_env, "unwrapped", raw_env)
+    if hasattr(base_env, "capture_canvas_full_rgba"):
+        return base_env.capture_canvas_full_rgba()
     if not hasattr(base_env, "capture_canvas_raw_rgba"):
         raise AttributeError(f"{type(raw_env).__name__} has no capture_canvas_raw_rgba")
     return base_env.capture_canvas_raw_rgba()
@@ -26,13 +29,17 @@ def _obs_to_hwc(raw_env):
 class _ImageObsAdapter:
     """Adapt raw env image obs to saved model image shape (stack/transposed)."""
 
-    def __init__(self, model: PPO):
+    def __init__(self, model):
         img_space = model.observation_space.spaces.get("image", None)
         self.enabled = img_space is not None
         self.frames = None
         self.n_frames = 1
         self.channels_first = False
         self.expected_shape = None
+        self._per_frame_mode = "raw"
+        self._target_h = None
+        self._target_w = None
+        self._target_c_per_frame = None
         if not self.enabled:
             return
 
@@ -42,19 +49,45 @@ class _ImageObsAdapter:
         self.expected_shape = shp
         # CHW if first dim looks like channels.
         self.channels_first = shp[0] <= 64 and shp[1] > 16 and shp[2] > 16
+        if self.channels_first:
+            self._target_c_total = int(shp[0])
+            self._target_h = int(shp[1])
+            self._target_w = int(shp[2])
+        else:
+            self._target_h = int(shp[0])
+            self._target_w = int(shp[1])
+            self._target_c_total = int(shp[2])
 
     def _init_if_needed(self, image_hwc: np.ndarray):
         if not self.enabled or self.frames is not None:
             return
         c_cur = int(image_hwc.shape[2])
-        if self.channels_first:
-            c_exp = int(self.expected_shape[0])
+        c_exp = int(self._target_c_total)
+        if c_exp % max(1, c_cur) == 0:
+            self._per_frame_mode = "raw"
+            self._target_c_per_frame = c_cur
+            self.n_frames = max(1, c_exp // c_cur)
         else:
-            c_exp = int(self.expected_shape[2])
-        self.n_frames = max(1, c_exp // max(1, c_cur))
+            # Fallback to grayscale frame packing (e.g. 3 stacked gray frames).
+            self._per_frame_mode = "gray"
+            self._target_c_per_frame = 1
+            self.n_frames = max(1, c_exp)
         self.frames = deque(maxlen=self.n_frames)
+        first = self._preprocess_frame(image_hwc)
         for _ in range(self.n_frames):
-            self.frames.append(image_hwc.copy())
+            self.frames.append(first.copy())
+
+    def _preprocess_frame(self, image_hwc: np.ndarray) -> np.ndarray:
+        img = image_hwc
+        if img.shape[0] != self._target_h or img.shape[1] != self._target_w:
+            pil = Image.fromarray(img)
+            pil = pil.resize((self._target_w, self._target_h), Image.Resampling.LANCZOS)
+            img = np.asarray(pil, dtype=np.uint8)
+        if self._per_frame_mode == "gray":
+            pil = Image.fromarray(img)
+            gray = np.asarray(pil.convert("L"), dtype=np.uint8)
+            return np.expand_dims(gray, axis=2)
+        return img
 
     def reset(self, image_hwc: np.ndarray):
         if not self.enabled:
@@ -66,7 +99,7 @@ class _ImageObsAdapter:
         if not self.enabled:
             return
         self._init_if_needed(image_hwc)
-        self.frames.append(image_hwc.copy())
+        self.frames.append(self._preprocess_frame(image_hwc).copy())
 
     def transform(self, image_hwc: np.ndarray) -> np.ndarray:
         if not self.enabled:
@@ -81,7 +114,7 @@ class _ImageObsAdapter:
         return out
 
 
-def _build_model_obs(obs: dict, model: PPO, image_adapter: _ImageObsAdapter | None = None) -> dict:
+def _build_model_obs(obs: dict, model, image_adapter: _ImageObsAdapter | None = None) -> dict:
     # Pass only keys the trained policy expects (supports train.py and train_transformer.py).
     keys = model.observation_space.spaces.keys()
     model_obs = {}
@@ -93,19 +126,59 @@ def _build_model_obs(obs: dict, model: PPO, image_adapter: _ImageObsAdapter | No
     return model_obs
 
 
-def _get_sigma(model: PPO, model_obs: dict) -> float:
+def _get_sigma(model, model_obs: dict) -> float:
     with np.errstate(all="ignore"):
-        obs_tensor = obs_as_tensor(model_obs, model.device)
-        dist = model.policy.get_distribution(obs_tensor).distribution
-        if hasattr(dist, "stddev"):
-            std = dist.stddev.detach().cpu().numpy().reshape(-1)
-            if std.size > 0:
-                return float(std[0])
+        # PPO/SAC-style continuous policies
+        if hasattr(model.policy, "get_distribution"):
+            obs_tensor = obs_as_tensor(model_obs, model.device)
+            dist = model.policy.get_distribution(obs_tensor).distribution
+            if hasattr(dist, "stddev"):
+                std = dist.stddev.detach().cpu().numpy().reshape(-1)
+                if std.size > 0:
+                    return float(std[0])
         if hasattr(model.policy, "log_std"):
             log_std = model.policy.log_std.detach().cpu().numpy().reshape(-1)
             if log_std.size > 0:
                 return float(np.exp(log_std[0]))
+        # DQN has no action std; expose current exploration rate for logging.
+        if hasattr(model, "exploration_rate"):
+            return float(getattr(model, "exploration_rate"))
     return float("nan")
+
+
+def _load_model(model_path: str, algo: str):
+    algo_l = str(algo).lower()
+    if algo_l == "ppo":
+        return PPO.load(model_path, device="cpu")
+    if algo_l == "dqn":
+        return DQN.load(model_path, device="cpu")
+    raise ValueError(f"Unsupported algo for GIF callback: {algo}")
+
+
+def _map_action_for_env(model, action: np.ndarray, algo: str):
+    """
+    Map model action to env action.
+    - PPO: pass through.
+    - DQN: discrete idx -> centered continuous x in [-0.5, 0.5].
+    Returns: (env_action, logged_x, logged_idx)
+    """
+    algo_l = str(algo).lower()
+    arr = np.asarray(action).reshape(-1)
+    if arr.size == 0:
+        return np.asarray([0.0], dtype=np.float32), float("nan"), -1
+
+    if algo_l == "dqn":
+        idx = int(arr[0])
+        n = int(getattr(model.action_space, "n", 0))
+        if n <= 1:
+            x = 0.0
+        else:
+            t = float(np.clip(idx, 0, n - 1)) / float(n - 1)
+            x = float(t - 0.5)
+        return np.asarray([x], dtype=np.float32), float(x), int(idx)
+
+    x = float(arr[0])
+    return arr, x, -1
 
 
 def _generate_policy_gif_worker(
@@ -120,9 +193,10 @@ def _generate_policy_gif_worker(
     headless: bool,
     port_base: int,
     env_id: str,
+    algo: str,
 ):
     try:
-        model = PPO.load(model_path, device="cpu")
+        model = _load_model(model_path, algo=algo)
         image_adapter = _ImageObsAdapter(model)
         gif_file = Path(gif_path)
         action_log_path = str(gif_file.with_name(f"{gif_file.stem}_action.txt"))
@@ -138,10 +212,10 @@ def _generate_policy_gif_worker(
                 ready_poll_interval=0.02,
                 ready_timeout=2.0,
             )
-            # For node env, enable GUI only during GIF generation.
+            # Keep GUI disabled during evaluation/GIF generation.
+            # GIF is generated from captured frames in-process.
             if env_id == "SuikaEnvNode-v0":
-                env_kwargs["gui"] = True
-                env_kwargs["gui_fps"] = float(max(1, fps))
+                env_kwargs["gui"] = False
             env = gym.make(
                 env_id,
                 **env_kwargs,
@@ -171,16 +245,16 @@ def _generate_policy_gif_worker(
                 sigma = _get_sigma(model, model_obs)
                 action, _ = model.predict(model_obs, deterministic=False)
                 action = np.asarray(action).reshape(-1)
-                obs2, reward, terminated, truncated, info = env.step(action)
+                env_action, logged_x, logged_idx = _map_action_for_env(model, action, algo=algo)
+                obs2, reward, terminated, truncated, info = env.step(env_action)
                 if "image" in obs2:
                     image_adapter.update(obs2["image"])
                 done = done or bool(terminated or truncated)
                 next_obs_list.append(obs2)
-                x = float(action[0]) if action.size > 0 else float("nan")
                 score = float(info.get("score", float("nan")))
                 action_logs.append(
-                    f"{step_count + 1}\t{float(reward):.6f}\t{x:.6f}\t{action.tolist()}\t"
-                    f"{sigma:.6f}\t{score:.6f}\t{int(bool(terminated))}\t{int(bool(truncated))}"
+                    f"{step_count + 1}\t{float(reward):.6f}\t{logged_x:.6f}\t{action.tolist()}\t"
+                    f"{sigma:.6f}\t{score:.6f}\t{int(bool(terminated))}\t{int(bool(truncated))}\t{logged_idx}"
                 )
             obs_list = next_obs_list
             frames.append(_obs_to_hwc(raw_envs[0]))
@@ -197,7 +271,7 @@ def _generate_policy_gif_worker(
 
         imageio.mimsave(gif_path, frames, fps=fps)
         with open(action_log_path, "w", encoding="utf-8") as f:
-            f.write("step\treward\tx\taction\tsigma\tscore\tterminated\ttruncated\n")
+            f.write("step\treward\tx\taction\tsigma\tscore\tterminated\ttruncated\taction_idx\n")
             for line in action_logs:
                 f.write(line + "\n")
         if verbose > 0:
@@ -235,6 +309,7 @@ class PolicyGifCallback(BaseCallback):
         headless: bool,
         port_base: int,
         env_id: str = "SuikaEnv-v0",
+        algo: str = "ppo",
         total_timesteps: int | None = None,
         verbose: int = 0,
     ):
@@ -247,6 +322,7 @@ class PolicyGifCallback(BaseCallback):
         self.headless = bool(headless)
         self.port_base = int(port_base)
         self.env_id = str(env_id)
+        self.algo = str(algo).lower()
         self.total_timesteps_target = int(total_timesteps) if total_timesteps is not None else None
         self._last_export_at = 0
         self._export_idx = 0
@@ -280,6 +356,7 @@ class PolicyGifCallback(BaseCallback):
                 self.headless,
                 self.port_base,
                 self.env_id,
+                self.algo,
             ),
             daemon=False,
         )

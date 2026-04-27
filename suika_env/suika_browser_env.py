@@ -294,6 +294,13 @@ class SuikaBrowserEnv(gymnasium.Env):
     def capture_canvas_raw_rgba(self):
         """Debug helper: return cropped canvas before resize."""
         return self._capture_canvas_raw()
+
+    def capture_canvas_full_rgba(self):
+        """Debug helper: return full canvas (no right-side crop)."""
+        canvas = self.driver.find_element(By.ID, 'game-canvas')
+        image_string = canvas.screenshot_as_png
+        img = Image.open(io.BytesIO(image_string)).convert("RGBA")
+        return np.asarray(img)
     
     def _capture_canvas(self):
         img = Image.fromarray(self._capture_canvas_raw(), mode="RGBA")
@@ -348,9 +355,11 @@ class SuikaBrowserEnv(gymnasium.Env):
             terminal = (status == 3) or (js_state == 3) or bool(end_visible)
             truncated = False 
             info['score'] = score
-            reward = score - self.score
+            fruit_count = float(obs.get("fruit_count", np.array([0.0], dtype=np.float32))[0])
+            step_penalty = 0.5 * fruit_count
+            reward = (score - self.score) - step_penalty
             if terminal:
-                reward = -500.0
+                reward = -200.0 - step_penalty
             self.score = score
 
             return obs, reward, terminal, truncated, info
@@ -362,7 +371,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             info["score"] = prev_score
             self._restart_driver()
             obs, _ = self.reset()
-            return obs, -500.0, True, True, info
+            return obs, -200.0, True, True, info
 
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2.

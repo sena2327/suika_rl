@@ -42,6 +42,20 @@ from train import (
 )
 
 
+def resolve_device(requested: str) -> str:
+    dev = str(requested).lower().strip()
+    if dev == "mps":
+        mps_ok = bool(getattr(th.backends, "mps", None)) and th.backends.mps.is_available()
+        if not mps_ok:
+            print("[train_transformer] MPS requested but unavailable. Falling back to cpu.")
+            return "cpu"
+        return "mps"
+    if dev == "cuda" and not th.cuda.is_available():
+        print("[train_transformer] CUDA requested but unavailable. Falling back to cpu.")
+        return "cpu"
+    return dev
+
+
 class SuikaTransformerObsWrapper(gym.ObservationWrapper):
     """Keep only board-token features needed by transformer extractor."""
 
@@ -116,7 +130,7 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
 class GameOverEnforcerWrapper(gym.Wrapper):
     """Training-time safety net: enforce terminal semantics on episode end."""
 
-    def __init__(self, env: gym.Env, terminal_penalty: float = -500.0):
+    def __init__(self, env: gym.Env, terminal_penalty: float = -200.0):
         super().__init__(env)
         self.terminal_penalty = float(terminal_penalty)
 
@@ -124,6 +138,8 @@ class GameOverEnforcerWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         info = dict(info)
         ended = bool(terminated or truncated)
+        fruit_count = float(obs.get("fruit_count", np.array([0.0], dtype=np.float32))[0])
+        step_penalty = 0.5 * fruit_count
         if ended:
             # If JS already says LOSE/end UI, always treat as terminated.
             js_lose = False
@@ -145,7 +161,7 @@ class GameOverEnforcerWrapper(gym.Wrapper):
             if js_lose:
                 terminated = True
             # Always apply fixed terminal penalty on ended transitions.
-            reward = self.terminal_penalty
+            reward = self.terminal_penalty - step_penalty
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
@@ -288,7 +304,7 @@ def parse_args():
     p.add_argument(
         "--env-id",
         type=str,
-        default="SuikaEnv-v0",
+        default="SuikaEnvNode-v0",
         choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
         help="Training env id.",
     )
@@ -319,15 +335,16 @@ def parse_args():
     )
     p.add_argument("--gif-fps", type=int, default=20, help="GIF playback FPS.")
     p.add_argument("--gif-dir", type=Path, default=Path("gifs/transformer"))
-    p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda")
+    p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--terminal-penalty", type=float, default=-500.0)
+    p.add_argument("--terminal-penalty", type=float, default=-200.0)
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    actual_device = resolve_device(args.device)
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
@@ -372,18 +389,18 @@ def main():
             "n_envs": args.n_envs,
             "seed": args.seed,
             "headless": args.headless,
-            "learning_rate": 3e-4,
+            "learning_rate": 1e-4,
             "n_steps": effective_n_steps,
             "rollout_steps_total": effective_rollout_total,
             "batch_size": args.batch_size,
             "terminal_penalty": args.terminal_penalty,
             "gamma": 0.99,
             "gae_lambda": 0.95,
-            "clip_range": 0.2,
-            "ent_coef": 0.05,
+            "clip_range": 0.5,
+            "ent_coef": 0.01,
             "vf_coef": 0.5,
             "max_grad_norm": 0.5,
-            "device": args.device,
+            "device": actual_device,
             "gpu_id": args.gpu_id,
             "save_every_steps": args.save_every_steps,
             "restart_browser_every_steps": args.restart_browser_every_steps,
@@ -409,19 +426,19 @@ def main():
                 features_extractor_class=SuikaTransformerExtractor,
                 share_features_extractor=False,
             ),
-            learning_rate=3e-4,
+            learning_rate=1e-4,
             n_steps=effective_n_steps,
             batch_size=args.batch_size,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.10,
+            ent_coef=0.01,
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log=str(tb_dir),
             verbose=1,
             seed=args.seed,
-            device=args.device,
+            device=actual_device,
         )
 
         save_freq = args.save_every_steps if args.save_every_steps > 0 else 0

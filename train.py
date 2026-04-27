@@ -26,6 +26,7 @@ import torch as th
 import torch.nn as nn
 import wandb
 from gymnasium import spaces
+from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
@@ -46,25 +47,48 @@ def restore_terminal_cursor():
             pass
 
 
+def resolve_device(requested: str) -> str:
+    dev = str(requested).lower().strip()
+    if dev == "mps":
+        mps_ok = bool(getattr(th.backends, "mps", None)) and th.backends.mps.is_available()
+        if not mps_ok:
+            print("[train] MPS requested but unavailable. Falling back to cpu.")
+            return "cpu"
+        return "mps"
+    if dev == "cuda" and not th.cuda.is_available():
+        print("[train] CUDA requested but unavailable. Falling back to cpu.")
+        return "cpu"
+    return dev
+
+
 class SuikaImageObsWrapper(gym.ObservationWrapper):
-    """Use image-only observation for CNN policy input."""
+    """Use image-only observation for CNN policy input (grayscale 64x64)."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
-        image_space = env.observation_space["image"]
+        self._target_hw = (64, 64)
         self.observation_space = spaces.Dict(
             {
                 "image": spaces.Box(
-                    low=image_space.low.astype(np.uint8),
-                    high=image_space.high.astype(np.uint8),
-                    shape=image_space.shape,
+                    low=0,
+                    high=255,
+                    shape=(self._target_hw[0], self._target_hw[1], 1),
                     dtype=np.uint8,
                 )
             }
         )
 
     def observation(self, observation):
-        return {"image": observation["image"]}
+        img = observation["image"]
+        # Ensure 64x64 grayscale image for CNN input.
+        if img.shape[0] != self._target_hw[0] or img.shape[1] != self._target_hw[1]:
+            pil = Image.fromarray(img)
+            pil = pil.resize((self._target_hw[1], self._target_hw[0]), Image.Resampling.LANCZOS)
+        else:
+            pil = Image.fromarray(img)
+        gray = np.asarray(pil.convert("L"), dtype=np.uint8)
+        gray = np.expand_dims(gray, axis=2)
+        return {"image": gray}
 
 
 class SuikaImageFrameStackWrapper(gym.Wrapper):
@@ -359,6 +383,8 @@ def make_env(
             ready_poll_interval=0.02,
             ready_timeout=2.0,
             enable_image_observation=True,
+            img_width=64,
+            img_height=64,
         )
         if env_id == "SuikaEnv-v0":
             env_kwargs["port"] = port_base + rank
@@ -454,7 +480,7 @@ def parse_args():
         default=Path("gifs/cnn"),
         help="Directory for periodic policy GIFs.",
     )
-    p.add_argument("--device", type=str, default="cuda", help="SB3 device, e.g. auto|cpu|cuda")
+    p.add_argument("--device", type=str, default="cuda", help="SB3 device, e.g. auto|cpu|cuda|mps")
     p.add_argument(
         "--gpu-id",
         type=int,
@@ -466,6 +492,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    actual_device = resolve_device(args.device)
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
 
@@ -524,7 +551,7 @@ def main():
             "ent_coef": 0.01,
             "vf_coef": 0.5,
             "max_grad_norm": 0.5,
-            "device": args.device,
+            "device": actual_device,
             "gpu_id": args.gpu_id,
             "save_every_steps": args.save_every_steps,
             "restart_browser_every_steps": args.restart_browser_every_steps,
@@ -556,7 +583,7 @@ def main():
             tensorboard_log=str(tb_dir),
             verbose=1,
             seed=args.seed,
-            device=args.device,
+            device=actual_device,
         )
 
         save_freq = args.save_every_steps if args.save_every_steps > 0 else 0

@@ -280,6 +280,9 @@ class SuikaNodeEnv(gymnasium.Env):
     def capture_canvas_raw_rgba(self):
         return self._last_frame_raw
 
+    def capture_canvas_full_rgba(self):
+        return self._last_frame_full
+
     def reset(self, *, seed=None, options=None):
         if self._recycle_on_next_reset:
             self._restart_worker_process()
@@ -305,7 +308,7 @@ class SuikaNodeEnv(gymnasium.Env):
                 "worker_error": str(exc),
                 "worker_recovered": True,
             }
-            return obs, -500.0, True, True, info
+            return obs, -200.0, True, True, info
 
         self._worker_steps += 1
         obs = self._obs(out)

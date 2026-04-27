@@ -1,2 +1,0 @@
-GIF worker failed at step=10000
-RuntimeError: Given groups=1, weight of size [32, 12, 8, 8], expected input[1, 128, 128, 4] to have 12 channels, but got 128 channels instead

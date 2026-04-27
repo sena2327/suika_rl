@@ -321,8 +321,10 @@ class SuikaCore {
     this.addFruit(actionPixelX);
 
     const terminated = this.stateIndex === GAME_STATES.LOSE;
-    const reward = terminated ? -500.0 : this.score - prevScore;
     const snap = this._snapshot();
+    const fruitCount = Number.isFinite(snap.fruit_count) ? Number(snap.fruit_count) : 0.0;
+    const stepPenalty = 0.5 * fruitCount;
+    const reward = terminated ? (-200.0 - stepPenalty) : ((this.score - prevScore) - stepPenalty);
     return {
       ...snap,
       reward,
