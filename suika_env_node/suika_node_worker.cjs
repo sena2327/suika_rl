@@ -93,6 +93,7 @@ class SuikaCore {
     this._stepLoseHits = 0;
     this._stepFirstLoseEvent = null;
     this._loseHitsTotal = 0;
+    this._stepMergeReward = 0.0;
     this.reset(this.seed);
   }
 
@@ -172,6 +173,8 @@ class SuikaCore {
         }
 
         this.fruitsMerged[bodyA.sizeIndex] += 1;
+        // Merge reward: cherry=0.1, strawberry=0.2, ..., melon=1.0 (capped at 1.0).
+        this._stepMergeReward += Math.min((Number(bodyA.sizeIndex) + 1) * 0.1, 1.0);
         const midPosX = (bodyA.position.x + bodyB.position.x) / 2;
         const midPosY = (bodyA.position.y + bodyB.position.y) / 2;
 
@@ -310,10 +313,10 @@ class SuikaCore {
     this._stepCollisionPairs = 0;
     this._stepLoseHits = 0;
     this._stepFirstLoseEvent = null;
+    this._stepMergeReward = 0.0;
 
-    const prevScore = this.score;
-    const xCentered = clamp(Number(actionCentered) || 0, -0.5, 0.5);
-    const xNorm = xCentered + 0.5;
+    const xCentered = clamp(Number(actionCentered) || 0, -1.0, 1.0);
+    const xNorm = (xCentered + 1.0) * 0.5;
     this.currentFruitX = xNorm;
     this.previewX = xNorm * WIDTH;
 
@@ -323,8 +326,11 @@ class SuikaCore {
     const terminated = this.stateIndex === GAME_STATES.LOSE;
     const snap = this._snapshot();
     const fruitCount = Number.isFinite(snap.fruit_count) ? Number(snap.fruit_count) : 0.0;
-    const stepPenalty = 0.5 * fruitCount;
-    const reward = terminated ? (-200.0 - stepPenalty) : ((this.score - prevScore) - stepPenalty);
+    const maxHeight = Number.isFinite(snap.max_height) ? Number(snap.max_height) : 0.0;
+    const fruitPenalty = 0.001 * fruitCount;
+    const heightPenalty = 0.1 * maxHeight;
+    const terminalPenalty = terminated ? 5.0 : 0.0;
+    const reward = this._stepMergeReward - fruitPenalty - heightPenalty - terminalPenalty;
     return {
       ...snap,
       reward,

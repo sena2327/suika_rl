@@ -120,7 +120,7 @@ class SuikaImageFrameStackWrapper(gym.Wrapper):
 
 
 class DiscreteActionWrapper(gym.Wrapper):
-    """Convert discrete action index -> centered continuous x in [-0.5, 0.5]."""
+    """Convert discrete action index -> centered continuous x in [-1, 1]."""
 
     def __init__(self, env: gym.Env, n_bins: int = 51):
         super().__init__(env)
@@ -129,7 +129,7 @@ class DiscreteActionWrapper(gym.Wrapper):
 
     def _idx_to_x(self, idx: int) -> float:
         t = float(np.clip(idx, 0, self.n_bins - 1)) / float(self.n_bins - 1)
-        return float(t - 0.5)
+        return float((2.0 * t) - 1.0)
 
     def step(self, action):
         idx = int(np.asarray(action).reshape(-1)[0])
@@ -197,6 +197,8 @@ class FinalScoreLoggingCallback(BaseCallback):
                 continue
             info = infos[i] if i < len(infos) else {}
             term_info = info.get("final_info", info)
+            if bool(term_info.get("discard_episode", info.get("discard_episode", False))):
+                continue
             score = term_info.get("score", info.get("score", None))
             if score is None:
                 continue

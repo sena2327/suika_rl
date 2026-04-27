@@ -130,7 +130,7 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
 class GameOverEnforcerWrapper(gym.Wrapper):
     """Training-time safety net: enforce terminal semantics on episode end."""
 
-    def __init__(self, env: gym.Env, terminal_penalty: float = -200.0):
+    def __init__(self, env: gym.Env, terminal_penalty: float = -5.0):
         super().__init__(env)
         self.terminal_penalty = float(terminal_penalty)
 
@@ -138,8 +138,6 @@ class GameOverEnforcerWrapper(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         info = dict(info)
         ended = bool(terminated or truncated)
-        fruit_count = float(obs.get("fruit_count", np.array([0.0], dtype=np.float32))[0])
-        step_penalty = 0.5 * fruit_count
         if ended:
             # If JS already says LOSE/end UI, always treat as terminated.
             js_lose = False
@@ -160,8 +158,10 @@ class GameOverEnforcerWrapper(gym.Wrapper):
                     js_lose = False
             if js_lose:
                 terminated = True
-            # Always apply fixed terminal penalty on ended transitions.
-            reward = self.terminal_penalty - step_penalty
+            # Keep environment reward shaping as-is.
+            # Only enforce terminal semantics and ensure LOSE has at least the configured penalty.
+            if terminated and float(reward) > self.terminal_penalty:
+                reward = self.terminal_penalty
         return obs, float(reward), bool(terminated), bool(truncated), info
 
 
@@ -338,7 +338,7 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--terminal-penalty", type=float, default=-200.0)
+    p.add_argument("--terminal-penalty", type=float, default=-5.0)
     return p.parse_args()
 
 

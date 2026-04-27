@@ -37,7 +37,7 @@ class SuikaNodeEnv(gymnasium.Env):
         self._plt = None
         self._render_width = 640
         self._render_height = 960
-        self._render_crop_width = 520
+        self._render_crop_width = self._render_width
         self._fruit_radii = [24, 32, 40, 56, 64, 72, 84, 96, 128, 160, 192]
         assets_dir = Path(__file__).with_name("suika-game") / "assets" / "img"
         self._circle_sprites: dict[int, Image.Image] = {}
@@ -81,7 +81,7 @@ class SuikaNodeEnv(gymnasium.Env):
                 "board_fruit_mask": gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
             }
         )
-        self.action_space = gymnasium.spaces.Box(low=-0.5, high=0.5, shape=(1,), dtype=np.float32)
+        self.action_space = gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
     def _start_worker(self) -> subprocess.Popen:
         return subprocess.Popen(
@@ -209,7 +209,7 @@ class SuikaNodeEnv(gymnasium.Env):
         score = float(snap.get("score", 0.0))
         draw.text((12, 8), f"{score:.0f}", font=self._score_font, fill=(24, 24, 24, 255))
 
-        # suika_env screenshot crops canvas from x:[0, 520).
+        # Keep full canvas for observation to avoid information loss.
         full = np.asarray(canvas, dtype=np.uint8)
         cropped = canvas.crop((0, 0, self._render_crop_width, self._render_height))
         return full, np.asarray(cropped, dtype=np.uint8)
@@ -307,8 +307,10 @@ class SuikaNodeEnv(gymnasium.Env):
                 "score": float(self.score),
                 "worker_error": str(exc),
                 "worker_recovered": True,
+                "discard_episode": True,
+                "discard_reason": "node_worker_recovery",
             }
-            return obs, -200.0, True, True, info
+            return obs, 0.0, True, True, info
 
         self._worker_steps += 1
         obs = self._obs(out)

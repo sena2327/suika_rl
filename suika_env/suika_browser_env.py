@@ -65,6 +65,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.img_height = int(img_height)
         self.enable_image_observation = bool(enable_image_observation)
         self._blank_image = np.zeros((self.img_height, self.img_width, 4), dtype=np.uint8)
+        self._prev_merged_counts = np.zeros(11, dtype=np.float32)
         self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
@@ -85,7 +86,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             'board_fruit_mask': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
         }
         self.observation_space = gymnasium.spaces.Dict(_obs_dict)
-        self.action_space = gymnasium.spaces.Box(low=-0.5, high=0.5, shape=(1,), dtype=np.float32)
+        self.action_space = gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
 
     def _create_driver(self):
         driver = webdriver.Chrome(options=self._chrome_options)
@@ -109,7 +110,11 @@ class SuikaBrowserEnv(gymnasium.Env):
         self._reload()
         info = {}
         self.score = 0
-        obs, status, _ = self._get_obs_and_status()
+        self._prev_merged_counts = np.zeros(11, dtype=np.float32)
+        obs, status, _, snapshot = self._get_obs_and_status()
+        merged = snapshot.get("merged_counts", None)
+        if merged is not None:
+            self._prev_merged_counts = np.asarray(merged, dtype=np.float32)
         return obs, info
 
     def _reload(self):
@@ -166,7 +171,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             board_fruit_mass=np.array(snapshot["board_fruit_mass"], dtype=np.float32),
             board_fruit_type=np.array(snapshot["board_fruit_type"], dtype=np.float32),
             board_fruit_mask=np.array(snapshot["board_fruit_mask"], dtype=np.float32),
-        ), snapshot["status"], float(snapshot["score"])
+        ), snapshot["status"], float(snapshot["score"]), snapshot
 
     def _query_game_snapshot(self):
         # Game object can be transiently unavailable right after reload/start.
@@ -246,6 +251,12 @@ class SuikaBrowserEnv(gymnasium.Env):
                 const minY = fruits.length > 0 ? Math.min(...fruits.map((b) => b.position.y)) : 960;
                 const maxHeight = Math.max(0.0, Math.min(1.0, (960 - minY) / 960.0));
                 const dangerCount = fruits.filter((b) => b.position.y <= 84).length;
+                const merged = Array.isArray(game.fruitsMerged) ? game.fruitsMerged : [];
+                const mergedCounts = [];
+                for (let i = 0; i < 11; i++) {
+                  const c = Number(merged[i]);
+                  mergedCounts.push(Number.isFinite(c) ? c : 0);
+                }
                 return {
                   status,
                   score,
@@ -264,6 +275,7 @@ class SuikaBrowserEnv(gymnasium.Env):
                   board_fruit_mass: boardMass,
                   board_fruit_type: boardType,
                   board_fruit_mask: boardMask,
+                  merged_counts: mergedCounts,
                 };
             })();
         """)
@@ -288,15 +300,16 @@ class SuikaBrowserEnv(gymnasium.Env):
                     "board_fruit_mass": [0.0] * 40,
                     "board_fruit_type": [0.0] * 40,
                     "board_fruit_mask": [0.0] * 40,
+                    "merged_counts": [0.0] * 11,
                 }
             time.sleep(0.02)
 
     def capture_canvas_raw_rgba(self):
-        """Debug helper: return cropped canvas before resize."""
+        """Debug helper: return full canvas before resize."""
         return self._capture_canvas_raw()
 
     def capture_canvas_full_rgba(self):
-        """Debug helper: return full canvas (no right-side crop)."""
+        """Debug helper: return full canvas."""
         canvas = self.driver.find_element(By.ID, 'game-canvas')
         image_string = canvas.screenshot_as_png
         img = Image.open(io.BytesIO(image_string)).convert("RGBA")
@@ -313,8 +326,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         canvas = self.driver.find_element(By.ID, 'game-canvas')
         image_string = canvas.screenshot_as_png
         img = Image.open(io.BytesIO(image_string)).convert("RGBA")
-        # first crop out right hand side and lower bar.
-        img = img.crop((0, 0, 520, img.height))
+        # Keep full game canvas for observation to avoid losing state information.
         return np.asarray(img)
 
     
@@ -323,9 +335,9 @@ class SuikaBrowserEnv(gymnasium.Env):
         action = float(action[0])
         info = {}
         try:
-            # Centered action in [-0.5, 0.5] -> normalized position in [0, 1].
-            x_centered = float(np.clip(action, -0.5, 0.5))
-            x_norm = x_centered + 0.5
+            # Centered action in [-1, 1] -> normalized position in [0, 1].
+            x_centered = float(np.clip(action, -1.0, 1.0))
+            x_norm = (x_centered + 1.0) * 0.5
             action = str(int(x_norm * 640))
             # clear the input box with id "fruit-position"
             driver.find_element(By.ID, 'fruit-position').clear()
@@ -338,7 +350,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             elif self.delay_before_img_capture > 0:
                 time.sleep(self.delay_before_img_capture)
 
-            obs, status, score = self._get_obs_and_status()
+            obs, status, score, snapshot = self._get_obs_and_status()
             js_score = self.driver.execute_script(
                 "return Number.isFinite(window.Game?.score) ? window.Game.score : null;"
             )
@@ -355,11 +367,25 @@ class SuikaBrowserEnv(gymnasium.Env):
             terminal = (status == 3) or (js_state == 3) or bool(end_visible)
             truncated = False 
             info['score'] = score
+
+            # Reward design:
+            #   merge reward: cherry=+0.1, strawberry=+0.2, ..., melon=+1.0
+            #   fruit-count penalty: 0.001 * fruit_count
+            #   height penalty: -x/100 where x is board height percent (max_height in [0,1] => 0.1*max_height)
+            #   gameover penalty: -5.0
+            merged_now = np.asarray(snapshot.get("merged_counts", [0.0] * 11), dtype=np.float32)
+            merged_prev = getattr(self, "_prev_merged_counts", np.zeros(11, dtype=np.float32))
+            merged_delta = np.maximum(merged_now - merged_prev, 0.0)
+            merge_reward_weights = np.minimum((np.arange(11, dtype=np.float32) + 1.0) * 0.1, 1.0)
+            merge_reward = float(np.sum(merged_delta * merge_reward_weights))
+            self._prev_merged_counts = merged_now
+
             fruit_count = float(obs.get("fruit_count", np.array([0.0], dtype=np.float32))[0])
-            step_penalty = 0.5 * fruit_count
-            reward = (score - self.score) - step_penalty
-            if terminal:
-                reward = -200.0 - step_penalty
+            max_height = float(obs.get("max_height", np.array([0.0], dtype=np.float32))[0])
+            fruit_penalty = 0.001 * fruit_count
+            height_penalty = 0.1 * max_height
+            terminal_penalty = 5.0 if terminal else 0.0
+            reward = merge_reward - fruit_penalty - height_penalty - terminal_penalty
             self.score = score
 
             return obs, reward, terminal, truncated, info
@@ -368,10 +394,12 @@ class SuikaBrowserEnv(gymnasium.Env):
             prev_score = float(self.score)
             info["browser_error"] = str(exc)
             info["recovered"] = True
+            info["discard_episode"] = True
+            info["discard_reason"] = "browser_recovery"
             info["score"] = prev_score
             self._restart_driver()
             obs, _ = self.reset()
-            return obs, -200.0, True, True, info
+            return obs, 0.0, True, True, info
 
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2.

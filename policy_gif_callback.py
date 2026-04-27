@@ -159,7 +159,7 @@ def _map_action_for_env(model, action: np.ndarray, algo: str):
     """
     Map model action to env action.
     - PPO: pass through.
-    - DQN: discrete idx -> centered continuous x in [-0.5, 0.5].
+    - DQN: discrete idx -> centered continuous x in [-1, 1].
     Returns: (env_action, logged_x, logged_idx)
     """
     algo_l = str(algo).lower()
@@ -174,7 +174,7 @@ def _map_action_for_env(model, action: np.ndarray, algo: str):
             x = 0.0
         else:
             t = float(np.clip(idx, 0, n - 1)) / float(n - 1)
-            x = float(t - 0.5)
+            x = float((2.0 * t) - 1.0)
         return np.asarray([x], dtype=np.float32), float(x), int(idx)
 
     x = float(arr[0])

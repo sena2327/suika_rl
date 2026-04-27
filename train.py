@@ -231,6 +231,8 @@ class FinalScoreLoggingCallback(BaseCallback):
                 continue
             info = infos[i] if i < len(infos) else {}
             term_info = info.get("final_info", info)
+            if bool(term_info.get("discard_episode", info.get("discard_episode", False))):
+                continue
             score = term_info.get("score", info.get("score", None))
             if score is None:
                 continue
@@ -279,7 +281,7 @@ class ActionStatsLoggingCallback(BaseCallback):
         else:
             x = arr[:, 0].astype(np.float32)
         # For centered action-space envs, clamp for interpretable rollout stats.
-        x = np.clip(x, -0.5, 0.5)
+        x = np.clip(x, -1.0, 1.0)
 
         x_mean = float(np.mean(x))
         x_var = float(np.var(x))
