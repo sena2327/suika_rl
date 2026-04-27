@@ -304,7 +304,7 @@ def parse_args():
     p.add_argument("--node-bin", type=str, default="node")
 
     p.add_argument("--learning-rate", type=float, default=1e-4)
-    p.add_argument("--buffer-size", type=int, default=200_000)
+    p.add_argument("--buffer-size", type=int, default=50_000)
     p.add_argument("--learning-starts", type=int, default=10_000)
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--gamma", type=float, default=0.99)
