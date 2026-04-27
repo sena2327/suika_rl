@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+from collections import deque
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -22,10 +23,74 @@ def _obs_to_hwc(raw_env):
     return base_env.capture_canvas_raw_rgba()
 
 
-def _build_model_obs(obs: dict, model: PPO) -> dict:
+class _ImageObsAdapter:
+    """Adapt raw env image obs to saved model image shape (stack/transposed)."""
+
+    def __init__(self, model: PPO):
+        img_space = model.observation_space.spaces.get("image", None)
+        self.enabled = img_space is not None
+        self.frames = None
+        self.n_frames = 1
+        self.channels_first = False
+        self.expected_shape = None
+        if not self.enabled:
+            return
+
+        shp = tuple(int(v) for v in img_space.shape)
+        if len(shp) != 3:
+            return
+        self.expected_shape = shp
+        # CHW if first dim looks like channels.
+        self.channels_first = shp[0] <= 64 and shp[1] > 16 and shp[2] > 16
+
+    def _init_if_needed(self, image_hwc: np.ndarray):
+        if not self.enabled or self.frames is not None:
+            return
+        c_cur = int(image_hwc.shape[2])
+        if self.channels_first:
+            c_exp = int(self.expected_shape[0])
+        else:
+            c_exp = int(self.expected_shape[2])
+        self.n_frames = max(1, c_exp // max(1, c_cur))
+        self.frames = deque(maxlen=self.n_frames)
+        for _ in range(self.n_frames):
+            self.frames.append(image_hwc.copy())
+
+    def reset(self, image_hwc: np.ndarray):
+        if not self.enabled:
+            return
+        self.frames = None
+        self._init_if_needed(image_hwc)
+
+    def update(self, image_hwc: np.ndarray):
+        if not self.enabled:
+            return
+        self._init_if_needed(image_hwc)
+        self.frames.append(image_hwc.copy())
+
+    def transform(self, image_hwc: np.ndarray) -> np.ndarray:
+        if not self.enabled:
+            return image_hwc
+        self._init_if_needed(image_hwc)
+        if self.n_frames > 1:
+            out = np.concatenate(list(self.frames), axis=2)
+        else:
+            out = image_hwc
+        if self.channels_first:
+            out = np.transpose(out, (2, 0, 1))
+        return out
+
+
+def _build_model_obs(obs: dict, model: PPO, image_adapter: _ImageObsAdapter | None = None) -> dict:
     # Pass only keys the trained policy expects (supports train.py and train_transformer.py).
     keys = model.observation_space.spaces.keys()
-    return {k: np.expand_dims(obs[k], axis=0) for k in keys}
+    model_obs = {}
+    for k in keys:
+        v = obs[k]
+        if k == "image" and image_adapter is not None:
+            v = image_adapter.transform(v)
+        model_obs[k] = np.expand_dims(v, axis=0)
+    return model_obs
 
 
 def _get_sigma(model: PPO, model_obs: dict) -> float:
@@ -58,6 +123,7 @@ def _generate_policy_gif_worker(
 ):
     try:
         model = PPO.load(model_path, device="cpu")
+        image_adapter = _ImageObsAdapter(model)
         gif_file = Path(gif_path)
         action_log_path = str(gif_file.with_name(f"{gif_file.stem}_action.txt"))
 
@@ -89,6 +155,8 @@ def _generate_policy_gif_worker(
         obs_list = []
         for i, env in enumerate(envs):
             obs, _ = env.reset(seed=seed + 1000 * export_idx + i)
+            if "image" in obs:
+                image_adapter.reset(obs["image"])
             obs_list.append(obs)
 
         frames.append(_obs_to_hwc(raw_envs[0]))
@@ -99,11 +167,13 @@ def _generate_policy_gif_worker(
             done = False
             for i, env in enumerate(envs):
                 obs = obs_list[i]
-                model_obs = _build_model_obs(obs, model)
+                model_obs = _build_model_obs(obs, model, image_adapter=image_adapter)
                 sigma = _get_sigma(model, model_obs)
                 action, _ = model.predict(model_obs, deterministic=False)
                 action = np.asarray(action).reshape(-1)
                 obs2, reward, terminated, truncated, info = env.step(action)
+                if "image" in obs2:
+                    image_adapter.update(obs2["image"])
                 done = done or bool(terminated or truncated)
                 next_obs_list.append(obs2)
                 x = float(action[0]) if action.size > 0 else float("nan")
