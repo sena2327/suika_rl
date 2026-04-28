@@ -108,7 +108,6 @@ def make_env_mlp(
     headless: bool,
     port_base: int,
     env_id: str,
-    reward_norm_gamma: float,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env_kwargs = dict(
@@ -127,7 +126,6 @@ def make_env_mlp(
             env_kwargs["port"] = port_base + rank
         env = gym.make(env_id, **env_kwargs)
         env = SuikaMLPObsWrapper(env)
-        env = gym.wrappers.NormalizeReward(env, gamma=reward_norm_gamma)
         env.reset(seed=seed + rank)
         return env
 
@@ -141,7 +139,6 @@ def parse_args():
     p.add_argument("--n-steps", type=int, default=128)
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--reward-norm-gamma", type=float, default=0.99)
     p.add_argument(
         "--env-id",
         type=str,
@@ -163,6 +160,7 @@ def parse_args():
     p.add_argument("--gif-dir", type=Path, default=Path("gifs/mlp"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
+    p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()
 
 
@@ -195,10 +193,23 @@ def main():
             args.headless,
             args.port_base,
             args.env_id,
-            args.reward_norm_gamma,
         )
         for i in range(args.n_envs)
     ]
+    if args.check:
+        env = env_fns[0]()
+        try:
+            obs, _ = env.reset(seed=args.seed)
+            print("[check] model input preview (train_mlp.py)")
+            for k, v in obs.items():
+                arr = np.asarray(v)
+                print(
+                    f"- {k}: shape={arr.shape}, dtype={arr.dtype}, "
+                    f"min={float(np.min(arr)):.6f}, max={float(np.max(arr)):.6f}"
+                )
+        finally:
+            env.close()
+        return
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
@@ -216,8 +227,7 @@ def main():
                 "total_timesteps": args.total_timesteps,
                 "n_envs": args.n_envs,
                 "seed": args.seed,
-                "reward_norm_gamma": args.reward_norm_gamma,
-                "learning_rate": 3e-4,
+                "learning_rate": 1e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
                 "batch_size": 256,
@@ -245,8 +255,11 @@ def main():
         model = PPO(
             "MultiInputPolicy",
             vec_env,
-            policy_kwargs=dict(features_extractor_class=SuikaMLPExtractor),
-            learning_rate=3e-4,
+            policy_kwargs=dict(
+                features_extractor_class=SuikaMLPExtractor,
+                share_features_extractor=False,
+            ),
+            learning_rate=1e-4,
             n_steps=effective_n_steps,
             batch_size=256,
             gamma=0.99,

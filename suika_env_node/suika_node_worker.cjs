@@ -367,7 +367,7 @@ class SuikaCore {
     const maxHeight = Number.isFinite(snap.max_height) ? Number(snap.max_height) : 0.0;
     const fruitPenalty = 0.001 * fruitCount;
     const heightPenalty = 0.1 * maxHeight;
-    const terminalPenalty = terminated ? 5.0 : 0.0;
+    const terminalPenalty = terminated ? 2.0 : 0.0;
     const reward = this._stepMergeReward - fruitPenalty - heightPenalty - terminalPenalty;
     return {
       ...snap,

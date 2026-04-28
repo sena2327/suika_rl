@@ -11,6 +11,7 @@ import argparse
 import os
 from pathlib import Path
 
+import numpy as np
 import torch as th
 import torch.nn as nn
 import wandb
@@ -101,7 +102,6 @@ def parse_args():
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--image-frame-stack", type=int, default=3)
-    p.add_argument("--reward-norm-gamma", type=float, default=0.99)
     p.add_argument(
         "--env-id",
         type=str,
@@ -124,6 +124,7 @@ def parse_args():
     p.add_argument("--gif-dir", type=Path, default=Path("gifs/coordconv"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
+    p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()
 
 
@@ -158,10 +159,23 @@ def main():
             args.port_base,
             args.env_id,
             args.image_frame_stack,
-            args.reward_norm_gamma,
         )
         for i in range(args.n_envs)
     ]
+    if args.check:
+        env = env_fns[0]()
+        try:
+            obs, _ = env.reset(seed=args.seed)
+            print("[check] model input preview (train_coordconv.py)")
+            for k, v in obs.items():
+                arr = np.asarray(v)
+                print(
+                    f"- {k}: shape={arr.shape}, dtype={arr.dtype}, "
+                    f"min={float(np.min(arr)):.6f}, max={float(np.max(arr)):.6f}"
+                )
+        finally:
+            env.close()
+        return
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
@@ -179,7 +193,6 @@ def main():
                 "n_envs": args.n_envs,
                 "seed": args.seed,
                 "image_frame_stack": args.image_frame_stack,
-                "reward_norm_gamma": args.reward_norm_gamma,
                 "delay_before_img_capture": args.delay_before_img_capture,
                 "headless": args.headless,
                 "learning_rate": 3e-4,

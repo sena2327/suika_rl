@@ -216,6 +216,8 @@ class FinalScoreLoggingCallback(BaseCallback):
     def __init__(self, verbose: int = 0):
         super().__init__(verbose=verbose)
         self._last_final_score_mean: float | None = None
+        # Very loose sanity ceiling: if score is far too large for episode length, treat as corrupted.
+        self._score_len_ratio_cap = 500.0
 
     def _on_step(self) -> bool:
         dones = self.locals.get("dones", None)
@@ -224,13 +226,15 @@ class FinalScoreLoggingCallback(BaseCallback):
             return True
 
         final_scores = []
+        outlier_count = 0
         # SubprocVecEnv may provide terminal-only info under "final_info".
         # Prefer terminal score when available.
         for i, done in enumerate(np.asarray(dones).tolist()):
             if not done:
                 continue
             info = infos[i] if i < len(infos) else {}
-            term_info = info.get("final_info", info)
+            has_final_info = "final_info" in info and isinstance(info.get("final_info", None), dict)
+            term_info = info["final_info"] if has_final_info else info
             if bool(term_info.get("discard_episode", info.get("discard_episode", False))):
                 continue
             final_score_valid = term_info.get("final_score_valid", info.get("final_score_valid", None))
@@ -240,15 +244,31 @@ class FinalScoreLoggingCallback(BaseCallback):
                 # Fallback for old envs: avoid truncated-only endings in final_score metric.
                 if bool(term_info.get("TimeLimit.truncated", info.get("TimeLimit.truncated", False))):
                     continue
-            score = term_info.get("score", info.get("score", None))
+            # Do not cross-fallback score between final_info and outer info.
+            # Mixed sources can produce corrupted outliers in vectorized auto-reset flow.
+            score = term_info.get("score", None)
             if score is None:
                 continue
             score_f = float(score)
             if not np.isfinite(score_f):
                 continue
+            ep_info = term_info.get("episode", info.get("episode", None))
+            if isinstance(ep_info, dict) and ep_info.get("l", None) is not None:
+                ep_len = float(ep_info["l"])
+                if np.isfinite(ep_len) and ep_len > 0:
+                    if score_f > (self._score_len_ratio_cap * ep_len):
+                        outlier_count += 1
+                        if self.verbose > 0:
+                            print(
+                                "[FinalScoreLoggingCallback] drop outlier "
+                                f"env={i} score={score_f:.2f} ep_len={ep_len:.1f}"
+                            )
+                        continue
             final_scores.append(score_f)
             # Aggregate done-episode scores within current SB3 log window.
             self.logger.record_mean("rollout/final_score", score_f)
+        if outlier_count > 0:
+            self.logger.record_mean("rollout/final_score_outlier_count", float(outlier_count))
 
         if final_scores:
             mean_score = float(np.mean(final_scores))
@@ -422,7 +442,6 @@ def make_env(
     port_base: int,
     env_id: str,
     image_frame_stack: int,
-    reward_norm_gamma: float,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env_kwargs = dict(
@@ -441,7 +460,6 @@ def make_env(
         env = gym.make(env_id, **env_kwargs)
         env = SuikaImageObsWrapper(env)
         env = SuikaImageFrameStackWrapper(env, n_frames=image_frame_stack)
-        env = gym.wrappers.NormalizeReward(env, gamma=reward_norm_gamma)
         return env
 
     return _init
@@ -472,12 +490,6 @@ def parse_args():
         type=int,
         default=3,
         help="Number of stacked image frames for CNN input.",
-    )
-    p.add_argument(
-        "--reward-norm-gamma",
-        type=float,
-        default=0.99,
-        help="Gamma for reward normalization wrapper.",
     )
     p.add_argument(
         "--env-id",
@@ -537,6 +549,7 @@ def parse_args():
         default=None,
         help="Physical GPU index to expose via CUDA_VISIBLE_DEVICES (e.g. 0).",
     )
+    p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()
 
 
@@ -571,10 +584,23 @@ def main():
             args.port_base,
             args.env_id,
             args.image_frame_stack,
-            args.reward_norm_gamma,
         )
         for i in range(args.n_envs)
     ]
+    if args.check:
+        env = env_fns[0]()
+        try:
+            obs, _ = env.reset(seed=args.seed)
+            print("[check] model input preview (train.py)")
+            for k, v in obs.items():
+                arr = np.asarray(v)
+                print(
+                    f"- {k}: shape={arr.shape}, dtype={arr.dtype}, "
+                    f"min={float(np.min(arr)):.6f}, max={float(np.max(arr)):.6f}"
+                )
+        finally:
+            env.close()
+        return
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
@@ -591,7 +617,6 @@ def main():
                 "n_envs": args.n_envs,
                 "seed": args.seed,
                 "image_frame_stack": args.image_frame_stack,
-                "reward_norm_gamma": args.reward_norm_gamma,
                 "delay_before_img_capture": args.delay_before_img_capture,
                 "headless": args.headless,
                 "learning_rate": 3e-4,

@@ -131,7 +131,7 @@ class SuikaTransformerObsWrapper(gym.ObservationWrapper):
 class GameOverEnforcerWrapper(gym.Wrapper):
     """Training-time safety net: enforce terminal semantics on episode end."""
 
-    def __init__(self, env: gym.Env, terminal_penalty: float = -5.0):
+    def __init__(self, env: gym.Env, terminal_penalty: float = -2.0):
         super().__init__(env)
         self.terminal_penalty = float(terminal_penalty)
 
@@ -290,8 +290,6 @@ def make_env(
             enable_image_observation=False,
         )
         env = GameOverEnforcerWrapper(env, terminal_penalty=terminal_penalty)
-        # Per-environment reward normalization (independent running stats in each worker).
-        env = gym.wrappers.NormalizeReward(env, gamma=0.99)
         env = SuikaTransformerObsWrapper(env)
         env.reset(seed=seed + rank)
         return env
@@ -339,7 +337,8 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--terminal-penalty", type=float, default=-5.0)
+    p.add_argument("--terminal-penalty", type=float, default=-2.0)
+    p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()
 
 
@@ -376,6 +375,20 @@ def main():
         )
         for i in range(args.n_envs)
     ]
+    if args.check:
+        env = env_fns[0]()
+        try:
+            obs, _ = env.reset(seed=args.seed)
+            print("[check] model input preview (train_transformer.py)")
+            for k, v in obs.items():
+                arr = np.asarray(v)
+                print(
+                    f"- {k}: shape={arr.shape}, dtype={arr.dtype}, "
+                    f"min={float(np.min(arr)):.6f}, max={float(np.max(arr)):.6f}"
+                )
+        finally:
+            env.close()
+        return
     vec_env = DummyVecEnv(env_fns) if args.n_envs == 1 else SubprocVecEnv(env_fns)
     vec_env = VecMonitor(vec_env)
 
