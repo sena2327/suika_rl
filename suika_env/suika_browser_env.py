@@ -79,6 +79,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
             'bitmap': gymnasium.spaces.Box(low=0, high=11, shape=(self.bitmap_size, self.bitmap_size),  dtype="uint8"),
+            'board_top50_exyir': gymnasium.spaces.Box(low=0, high=256, shape=(50, 5), dtype="float32"),
             'current_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'next_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'current_fruit_x': gymnasium.spaces.Box(low=0, high=1, shape=(1,), dtype="float32"),
@@ -168,6 +169,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         return dict(
             image=img,
             bitmap=bitmap,
+            board_top50_exyir=np.array(snapshot["board_top50_exyir"], dtype=np.float32),
             current_fruit_type=np.array([snapshot["current_fruit_type"]], dtype=np.float32),
             next_fruit_type=np.array([snapshot["next_fruit_type"]], dtype=np.float32),
             current_fruit_x=np.array([snapshot["current_fruit_x"]], dtype=np.float32),
@@ -244,6 +246,7 @@ class SuikaBrowserEnv(gymnasium.Env):
                 const boardMass = [];
                 const boardType = [];
                 const boardMask = [];
+                const top50 = [];
                 const bodies = engine?.world?.bodies || [];
                 const fruits = bodies
                   .filter((b) => !b.isStatic && Number.isFinite(b?.position?.x) && Number.isFinite(b?.position?.y) && Number.isFinite(b?.sizeIndex))
@@ -277,6 +280,27 @@ class SuikaBrowserEnv(gymnasium.Env):
                   boardMass.push(nm);
                   boardType.push(t);
                   boardMask.push(1.0);
+                }
+                const topFruitsByTop = [...fruits]
+                  .sort((a, b) => {
+                    const at = (a.position.y + (Number.isFinite(a.circleRadius) ? a.circleRadius : 0));
+                    const bt = (b.position.y + (Number.isFinite(b.circleRadius) ? b.circleRadius : 0));
+                    return at - bt;
+                  })
+                  .slice(0, 50);
+                for (const b of topFruitsByTop) {
+                  let nx = b.position.x / 640.0;
+                  let ny = b.position.y / 960.0;
+                  nx = Math.max(0.0, Math.min(1.0, nx));
+                  ny = Math.max(0.0, Math.min(1.0, ny));
+                  let t = Number.isFinite(b.sizeIndex) ? Math.floor(b.sizeIndex) + 1 : 0;
+                  t = Math.max(0, Math.min(11, t));
+                  let r = Number.isFinite(b.circleRadius) ? b.circleRadius : 0.0;
+                  r = Math.max(0.0, Math.min(256.0, r));
+                  top50.push([1.0, nx, ny, t, r]);
+                }
+                while (top50.length < 50) {
+                  top50.push([0.0, 0.0, 0.0, 0.0, 0.0]);
                 }
                 while (top10Types.length < 10) top10Types.push(0.0);
                 while (top10Mask.length < 10) top10Mask.push(0.0);
@@ -315,6 +339,7 @@ class SuikaBrowserEnv(gymnasium.Env):
                   board_fruit_mass: boardMass,
                   board_fruit_type: boardType,
                   board_fruit_mask: boardMask,
+                  board_top50_exyir: top50,
                   merged_counts: mergedCounts,
                 };
             })();
@@ -340,6 +365,7 @@ class SuikaBrowserEnv(gymnasium.Env):
                     "board_fruit_mass": [0.0] * 40,
                     "board_fruit_type": [0.0] * 40,
                     "board_fruit_mask": [0.0] * 40,
+                    "board_top50_exyir": [[0.0, 0.0, 0.0, 0.0, 0.0]] * 50,
                     "merged_counts": [0.0] * 11,
                 }
             time.sleep(0.02)

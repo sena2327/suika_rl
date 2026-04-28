@@ -10,6 +10,7 @@ const WIDTH = 640;
 const HEIGHT = 960;
 const MAX_TOP10 = 10;
 const MAX_BOARD = 40;
+const MAX_TOP50 = 50;
 const DT_MS = 1000 / 60;
 const READY_DELAY_MS = 500;
 const READY_TIMEOUT_MS = 2000;
@@ -412,12 +413,31 @@ class SuikaCore {
     const boardMass = [];
     const boardType = [];
     const boardMask = [];
+    const top50 = [];
     for (const b of boardFruits) {
       boardXY.push(clamp(b.position.x / WIDTH, 0, 1), clamp(b.position.y / HEIGHT, 0, 1));
       boardRadius.push(clamp((Number(b.circleRadius) || 0) / 100.0, 0, 1));
       boardMass.push(clamp((Number(b.mass) || 0) / 1000.0, 0, 1));
       boardType.push(clamp(Math.floor(b.sizeIndex), 0, 10));
       boardMask.push(1.0);
+    }
+    const topFruitsByTop = fruits
+      .slice()
+      .sort((a, b) => {
+        const at = a.position.y + (Number.isFinite(a.circleRadius) ? a.circleRadius : 0);
+        const bt = b.position.y + (Number.isFinite(b.circleRadius) ? b.circleRadius : 0);
+        return at - bt;
+      })
+      .slice(0, MAX_TOP50);
+    for (const b of topFruitsByTop) {
+      const nx = clamp(b.position.x / WIDTH, 0, 1);
+      const ny = clamp(b.position.y / HEIGHT, 0, 1);
+      const t = clamp(Math.floor(b.sizeIndex) + 1, 0, 11);
+      const r = clamp(Number.isFinite(b.circleRadius) ? Number(b.circleRadius) : 0, 0, 256);
+      top50.push([1.0, nx, ny, t, r]);
+    }
+    while (top50.length < MAX_TOP50) {
+      top50.push([0.0, 0.0, 0.0, 0.0, 0.0]);
     }
     while (boardXY.length < 80) boardXY.push(0.0);
     while (boardRadius.length < 40) boardRadius.push(0.0);
@@ -448,6 +468,7 @@ class SuikaCore {
       board_fruit_mass: boardMass,
       board_fruit_type: boardType,
       board_fruit_mask: boardMask,
+      board_top50_exyir: top50,
     };
   }
 }

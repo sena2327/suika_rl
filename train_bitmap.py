@@ -33,6 +33,7 @@ from policy_gif_callback import PolicyGifCallback
 from train import (
     ActionStatsLoggingCallback,
     BrowserRestartCallback,
+    EpisodeLengthMaxLoggingCallback,
     FinalScoreLoggingCallback,
     PolicyStdLoggingCallback,
     resolve_device,
@@ -341,6 +342,7 @@ def main():
                 )
             )
         callbacks.append(FinalScoreLoggingCallback(verbose=0))
+        callbacks.append(EpisodeLengthMaxLoggingCallback(verbose=0))
         callbacks.append(ActionStatsLoggingCallback(verbose=0))
         callbacks.append(PolicyStdLoggingCallback(verbose=0))
         if args.gif_eval_every_steps > 0:

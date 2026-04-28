@@ -223,6 +223,47 @@ class FinalScoreLoggingCallback(BaseCallback):
         return True
 
 
+class EpisodeLengthMaxLoggingCallback(BaseCallback):
+    """Log max episode length among episodes finished in current callback window."""
+
+    def __init__(self, verbose: int = 0):
+        super().__init__(verbose=verbose)
+        self._last_ep_len_max: float | None = None
+
+    def _on_step(self) -> bool:
+        dones = self.locals.get("dones", None)
+        infos = self.locals.get("infos", None)
+        if dones is None or infos is None:
+            return True
+
+        ep_lens = []
+        for i, done in enumerate(np.asarray(dones).tolist()):
+            if not done:
+                continue
+            info = infos[i] if i < len(infos) else {}
+            term_info = info.get("final_info", info)
+            if bool(term_info.get("discard_episode", info.get("discard_episode", False))):
+                continue
+            ep_info = term_info.get("episode", info.get("episode", None))
+            if not isinstance(ep_info, dict):
+                continue
+            l = ep_info.get("l", None)
+            if l is None:
+                continue
+            l_f = float(l)
+            if not np.isfinite(l_f):
+                continue
+            ep_lens.append(l_f)
+
+        if ep_lens:
+            ep_len_max = float(np.max(ep_lens))
+            self._last_ep_len_max = ep_len_max
+            self.logger.record("rollout/ep_len_max", ep_len_max)
+        elif self._last_ep_len_max is not None:
+            self.logger.record("rollout/ep_len_max", self._last_ep_len_max)
+        return True
+
+
 class ActionStatsLoggingCallback(BaseCallback):
     """Log mapped action-x mean/variance from info."""
 
@@ -430,7 +471,11 @@ def main():
             device=actual_device,
         )
 
-        callbacks = [FinalScoreLoggingCallback(verbose=0), ActionStatsLoggingCallback(verbose=0)]
+        callbacks = [
+            FinalScoreLoggingCallback(verbose=0),
+            EpisodeLengthMaxLoggingCallback(verbose=0),
+            ActionStatsLoggingCallback(verbose=0),
+        ]
         if wandb_enabled:
             save_freq = args.save_every_steps if args.save_every_steps > 0 else 0
             wandb_callback = WandbCallback(

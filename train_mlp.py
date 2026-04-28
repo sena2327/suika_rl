@@ -1,8 +1,11 @@
 """
-PPO training (CNN + CoordConv image input) for SuikaEnv-v0 / SuikaEnvNode-v0.
+PPO training with MLP input from internal board features.
 
-Run:
-  uv run python train_coordconv.py --env-id SuikaEnvNode-v0 --n-envs 16 --device cuda
+Input pipeline:
+  - Use obs["board_top50_exyir"] with shape (50, 5): [exist, x, y, id, r]
+  - Normalize x,y,id,r (x,y already in [0,1], id/11, r/256)
+  - One-hot current_hand and next_hand (11 dims each), concatenate
+  - Feed concatenated vector to MLP extractor
 """
 
 from __future__ import annotations
@@ -10,9 +13,13 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+from typing import Callable
 
+import gymnasium as gym
+import numpy as np
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from gymnasium import spaces
 from stable_baselines3 import PPO
@@ -30,67 +37,101 @@ from train import (
     EpisodeLengthMaxLoggingCallback,
     FinalScoreLoggingCallback,
     PolicyStdLoggingCallback,
-    make_env,
     resolve_device,
     restore_terminal_cursor,
 )
 
 
-class SuikaCoordConvExtractor(BaseFeaturesExtractor):
-    """CNN extractor with CoordConv channels (x, y)."""
+class SuikaMLPObsWrapper(gym.ObservationWrapper):
+    """Keep only board_top50_exyir and current/next hand type for MLP policy."""
 
-    def __init__(self, observation_space: spaces.Dict):
-        super().__init__(observation_space, features_dim=256)
-        image_space = observation_space["image"]
-        if len(image_space.shape) != 3:
-            raise ValueError(f"Expected 3D image space, got shape={image_space.shape}")
-
-        shp = tuple(int(v) for v in image_space.shape)
-        self._channels_first = shp[0] <= 16 and shp[1] > 16 and shp[2] > 16
-        if self._channels_first:
-            c, h, w = int(shp[0]), int(shp[1]), int(shp[2])
-        else:
-            h, w, c = int(shp[0]), int(shp[1]), int(shp[2])
-        self._h = h
-        self._w = w
-        self._base_c = c
-        self._coord_c = 2
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(self._base_c + self._coord_c, 32, kernel_size=8, stride=4),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=4, stride=2),
-            nn.ReLU(),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1),
-            nn.ReLU(),
-            nn.Flatten(),
+    def __init__(self, env: gym.Env):
+        super().__init__(env)
+        self.observation_space = spaces.Dict(
+            {
+                "board_top50_exyir": spaces.Box(
+                    low=0.0,
+                    high=256.0,
+                    shape=(50, 5),
+                    dtype=np.float32,
+                ),
+                "current_fruit_type": spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
+                "next_fruit_type": spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
+            }
         )
 
-        with th.no_grad():
-            sample = th.as_tensor(image_space.sample()[None]).float()
-            if not self._channels_first:
-                sample = sample.permute(0, 3, 1, 2).contiguous()
-            sample = sample / 255.0
-            sample = self._append_coord_channels(sample)
-            n_flatten = int(self.cnn(sample).shape[1])
+    def observation(self, observation):
+        return {
+            "board_top50_exyir": observation["board_top50_exyir"].astype(np.float32, copy=False),
+            "current_fruit_type": observation["current_fruit_type"].astype(np.float32, copy=False),
+            "next_fruit_type": observation["next_fruit_type"].astype(np.float32, copy=False),
+        }
 
-        self.linear = nn.Sequential(nn.Linear(n_flatten, 256), nn.ReLU())
+
+class SuikaMLPExtractor(BaseFeaturesExtractor):
+    """MLP extractor over flattened normalized board features + hand one-hots."""
+
+    def __init__(self, observation_space: spaces.Dict):
+        # board: 50 * 5 = 250, hand one-hot: 11 + 11 = 22, total 272
+        super().__init__(observation_space, features_dim=256)
+        self.n_hand = 11
+        in_dim = (50 * 5) + (self.n_hand * 2)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+        )
         self._features_dim = 256
 
-    def _append_coord_channels(self, image: th.Tensor) -> th.Tensor:
-        b, _, h, w = image.shape
-        y_lin = th.linspace(-1.0, 1.0, h, device=image.device, dtype=image.dtype)
-        x_lin = th.linspace(-1.0, 1.0, w, device=image.device, dtype=image.dtype)
-        y_map = y_lin.view(1, 1, h, 1).expand(b, 1, h, w)
-        x_map = x_lin.view(1, 1, 1, w).expand(b, 1, h, w)
-        return th.cat([image, x_map, y_map], dim=1)
-
     def forward(self, observations):
-        image = observations["image"].float() / 255.0
-        if not self._channels_first:
-            image = image.permute(0, 3, 1, 2).contiguous()
-        image = self._append_coord_channels(image)
-        return self.linear(self.cnn(image))
+        exyir = observations["board_top50_exyir"].float()  # (B,50,5)
+        exist = exyir[:, :, 0:1]  # 0/1
+        x = exyir[:, :, 1:2]  # already 0..1
+        y = exyir[:, :, 2:3]  # already 0..1
+        fruit_id = exyir[:, :, 3:4] / 11.0  # 0..11 -> 0..1
+        radius = exyir[:, :, 4:5] / 256.0  # pixel radius -> ~0..1
+        board_feat = th.cat([exist, x, y, fruit_id, radius], dim=2).reshape(exyir.shape[0], -1)
+
+        cur_idx = observations["current_fruit_type"].long().squeeze(1).clamp(0, self.n_hand - 1)
+        nxt_idx = observations["next_fruit_type"].long().squeeze(1).clamp(0, self.n_hand - 1)
+        cur_onehot = F.one_hot(cur_idx, num_classes=self.n_hand).float()
+        nxt_onehot = F.one_hot(nxt_idx, num_classes=self.n_hand).float()
+
+        feat = th.cat([board_feat, cur_onehot, nxt_onehot], dim=1)
+        return self.mlp(feat)
+
+
+def make_env_mlp(
+    rank: int,
+    seed: int,
+    headless: bool,
+    port_base: int,
+    env_id: str,
+    reward_norm_gamma: float,
+) -> Callable[[], gym.Env]:
+    def _init() -> gym.Env:
+        env_kwargs = dict(
+            headless=headless,
+            delay_before_img_capture=0.0,
+            mute_sound=True,
+            wait_for_ready_on_step=True,
+            ready_poll_interval=0.02,
+            ready_timeout=2.0,
+            enable_image_observation=False,
+            bitmap_size=128,
+            img_width=128,
+            img_height=128,
+        )
+        if env_id == "SuikaEnv-v0":
+            env_kwargs["port"] = port_base + rank
+        env = gym.make(env_id, **env_kwargs)
+        env = SuikaMLPObsWrapper(env)
+        env = gym.wrappers.NormalizeReward(env, gamma=reward_norm_gamma)
+        env.reset(seed=seed + rank)
+        return env
+
+    return _init
 
 
 def parse_args():
@@ -100,7 +141,6 @@ def parse_args():
     p.add_argument("--n-steps", type=int, default=128)
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--image-frame-stack", type=int, default=3)
     p.add_argument("--reward-norm-gamma", type=float, default=0.99)
     p.add_argument(
         "--env-id",
@@ -109,10 +149,9 @@ def parse_args():
         choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
     )
     p.add_argument("--port-base", type=int, default=8923)
-    p.add_argument("--delay-before-img-capture", type=float, default=0.1)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
-    p.add_argument("--save-path", type=Path, default=Path("models/coordconv/ppo_suika_coordconv"))
+    p.add_argument("--save-path", type=Path, default=Path("models/mlp/ppo_suika_mlp"))
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
@@ -121,7 +160,7 @@ def parse_args():
     p.add_argument("--gif-eval-every-steps", type=int, default=10_000)
     p.add_argument("--gif-eval-steps", type=int, default=10000)
     p.add_argument("--gif-fps", type=int, default=20)
-    p.add_argument("--gif-dir", type=Path, default=Path("gifs/coordconv"))
+    p.add_argument("--gif-dir", type=Path, default=Path("gifs/mlp"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
     return p.parse_args()
@@ -140,24 +179,22 @@ def main():
         effective_n_steps = max(1, args.rollout_steps_total // args.n_envs)
     effective_rollout_total = effective_n_steps * args.n_envs
     print(
-        f"[train_coordconv] n_envs={args.n_envs}, n_steps={effective_n_steps}, "
+        f"[train_mlp] n_envs={args.n_envs}, n_steps={effective_n_steps}, "
         f"rollout_total={effective_rollout_total}"
     )
 
     wandb_enabled = bool(args.wandb_run_name)
-    run_name = args.wandb_run_name or f"ppo-suika-coordconv-seed{args.seed}"
+    run_name = args.wandb_run_name or f"ppo-suika-mlp-seed{args.seed}"
     tb_dir = Path("runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
 
     env_fns = [
-        make_env(
+        make_env_mlp(
             i,
             args.seed,
             args.headless,
-            args.delay_before_img_capture,
             args.port_base,
             args.env_id,
-            args.image_frame_stack,
             args.reward_norm_gamma,
         )
         for i in range(args.n_envs)
@@ -173,15 +210,13 @@ def main():
             name=run_name,
             config={
                 "algo": "PPO",
-                "extractor": "CoordConvCNN",
+                "extractor": "MLP",
+                "obs": "board_top50_exyir + hand_onehot",
                 "env_id": args.env_id,
                 "total_timesteps": args.total_timesteps,
                 "n_envs": args.n_envs,
                 "seed": args.seed,
-                "image_frame_stack": args.image_frame_stack,
                 "reward_norm_gamma": args.reward_norm_gamma,
-                "delay_before_img_capture": args.delay_before_img_capture,
-                "headless": args.headless,
                 "learning_rate": 3e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
@@ -207,11 +242,10 @@ def main():
 
     interrupted = False
     try:
-        policy_kwargs = dict(features_extractor_class=SuikaCoordConvExtractor)
         model = PPO(
             "MultiInputPolicy",
             vec_env,
-            policy_kwargs=policy_kwargs,
+            policy_kwargs=dict(features_extractor_class=SuikaMLPExtractor),
             learning_rate=3e-4,
             n_steps=effective_n_steps,
             batch_size=256,

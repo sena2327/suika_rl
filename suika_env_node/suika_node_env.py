@@ -67,6 +67,7 @@ class SuikaNodeEnv(gymnasium.Env):
             {
                 "image": gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4), dtype="uint8"),
                 "bitmap": gymnasium.spaces.Box(low=0, high=11, shape=(self.bitmap_size, self.bitmap_size), dtype="uint8"),
+                "board_top50_exyir": gymnasium.spaces.Box(low=0, high=256, shape=(50, 5), dtype="float32"),
                 "current_fruit_type": gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
                 "next_fruit_type": gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
                 "current_fruit_x": gymnasium.spaces.Box(low=0, high=1, shape=(1,), dtype="float32"),
@@ -262,6 +263,7 @@ class SuikaNodeEnv(gymnasium.Env):
         return {
             "image": image,
             "bitmap": bitmap,
+            "board_top50_exyir": np.array(snap["board_top50_exyir"], dtype=np.float32),
             "current_fruit_type": np.array([snap["current_fruit_type"]], dtype=np.float32),
             "next_fruit_type": np.array([snap["next_fruit_type"]], dtype=np.float32),
             "current_fruit_x": np.array([snap["current_fruit_x"]], dtype=np.float32),
