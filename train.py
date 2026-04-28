@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import os
 import subprocess
-from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -24,6 +23,7 @@ import gymnasium as gym
 import numpy as np
 import torch as th
 import torch.nn as nn
+import torch.nn.functional as F
 import wandb
 from gymnasium import spaces
 from PIL import Image
@@ -62,7 +62,7 @@ def resolve_device(requested: str) -> str:
 
 
 class SuikaImageObsWrapper(gym.ObservationWrapper):
-    """Use image-only observation for CNN policy input (grayscale 64x64)."""
+    """Use RGB single-frame image + hand types for CNN policy input."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
@@ -72,65 +72,32 @@ class SuikaImageObsWrapper(gym.ObservationWrapper):
                 "image": spaces.Box(
                     low=0,
                     high=255,
-                    shape=(self._target_hw[0], self._target_hw[1], 1),
+                    shape=(self._target_hw[0], self._target_hw[1], 3),
                     dtype=np.uint8,
-                )
+                ),
+                "current_fruit_type": spaces.Box(low=0, high=10, shape=(1,), dtype=np.float32),
+                "next_fruit_type": spaces.Box(low=0, high=10, shape=(1,), dtype=np.float32),
             }
         )
 
     def observation(self, observation):
         img = observation["image"]
-        # Ensure 64x64 grayscale image for CNN input.
+        # Ensure 64x64 RGB image for CNN input.
         if img.shape[0] != self._target_hw[0] or img.shape[1] != self._target_hw[1]:
             pil = Image.fromarray(img)
             pil = pil.resize((self._target_hw[1], self._target_hw[0]), Image.Resampling.LANCZOS)
         else:
             pil = Image.fromarray(img)
-        gray = np.asarray(pil.convert("L"), dtype=np.uint8)
-        gray = np.expand_dims(gray, axis=2)
-        return {"image": gray}
-
-
-class SuikaImageFrameStackWrapper(gym.Wrapper):
-    """Stack the latest N image frames along channel axis (H, W, C*N)."""
-
-    def __init__(self, env: gym.Env, n_frames: int = 3):
-        super().__init__(env)
-        self.n_frames = max(1, int(n_frames))
-        base_img_space = env.observation_space["image"]
-        h, w, c = base_img_space.shape
-        self._frames = deque(maxlen=self.n_frames)
-        self.observation_space = spaces.Dict(
-            {
-                "image": spaces.Box(
-                    low=0,
-                    high=255,
-                    shape=(h, w, c * self.n_frames),
-                    dtype=np.uint8,
-                )
-            }
-        )
-
-    def _stacked_obs(self):
-        stacked = np.concatenate(list(self._frames), axis=2)
-        return {"image": stacked}
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        img = obs["image"]
-        self._frames.clear()
-        for _ in range(self.n_frames):
-            self._frames.append(img.copy())
-        return self._stacked_obs(), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._frames.append(obs["image"].copy())
-        return self._stacked_obs(), reward, terminated, truncated, info
+        rgb = np.asarray(pil.convert("RGB"), dtype=np.uint8)
+        return {
+            "image": rgb,
+            "current_fruit_type": observation["current_fruit_type"].astype(np.float32, copy=False),
+            "next_fruit_type": observation["next_fruit_type"].astype(np.float32, copy=False),
+        }
 
 
 class SuikaImageCnnExtractor(BaseFeaturesExtractor):
-    """CNN extractor for image-only dict observation."""
+    """CNN extractor for image + hand one-hot."""
 
     def __init__(self, observation_space: spaces.Dict):
         super().__init__(observation_space, features_dim=256)
@@ -158,14 +125,25 @@ class SuikaImageCnnExtractor(BaseFeaturesExtractor):
             if not self._channels_first:
                 sample = sample.permute(0, 3, 1, 2).contiguous()
             n_flatten = int(self.cnn(sample).shape[1])
-        self.linear = nn.Sequential(nn.Linear(n_flatten, 256), nn.ReLU())
+        self._n_hand = 11
+        self.image_head = nn.Sequential(nn.Linear(n_flatten, 224), nn.ReLU())
+        self.hand_head = nn.Sequential(nn.Linear(self._n_hand * 2, 32), nn.ReLU())
+        self.linear = nn.Sequential(nn.Linear(224 + 32, 256), nn.ReLU())
         self._features_dim = 256
 
     def forward(self, observations):
         image = observations["image"].float() / 255.0
         if not self._channels_first:
             image = image.permute(0, 3, 1, 2).contiguous()
-        return self.linear(self.cnn(image))
+        image_feat = self.image_head(self.cnn(image))
+
+        cur_idx = observations["current_fruit_type"].long().squeeze(1).clamp(0, self._n_hand - 1)
+        nxt_idx = observations["next_fruit_type"].long().squeeze(1).clamp(0, self._n_hand - 1)
+        cur_onehot = F.one_hot(cur_idx, num_classes=self._n_hand).float()
+        nxt_onehot = F.one_hot(nxt_idx, num_classes=self._n_hand).float()
+        hand_feat = self.hand_head(th.cat([cur_onehot, nxt_onehot], dim=1))
+
+        return self.linear(th.cat([image_feat, hand_feat], dim=1))
 
 
 class BrowserRestartCallback(BaseCallback):
@@ -441,7 +419,6 @@ def make_env(
     delay: float,
     port_base: int,
     env_id: str,
-    image_frame_stack: int,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env_kwargs = dict(
@@ -459,7 +436,6 @@ def make_env(
             env_kwargs["port"] = port_base + rank
         env = gym.make(env_id, **env_kwargs)
         env = SuikaImageObsWrapper(env)
-        env = SuikaImageFrameStackWrapper(env, n_frames=image_frame_stack)
         return env
 
     return _init
@@ -485,12 +461,6 @@ def parse_args():
         ),
     )
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument(
-        "--image-frame-stack",
-        type=int,
-        default=3,
-        help="Number of stacked image frames for CNN input.",
-    )
     p.add_argument(
         "--env-id",
         type=str,
@@ -583,7 +553,6 @@ def main():
             args.delay_before_img_capture,
             args.port_base,
             args.env_id,
-            args.image_frame_stack,
         )
         for i in range(args.n_envs)
     ]
@@ -616,7 +585,6 @@ def main():
                 "total_timesteps": args.total_timesteps,
                 "n_envs": args.n_envs,
                 "seed": args.seed,
-                "image_frame_stack": args.image_frame_stack,
                 "delay_before_img_capture": args.delay_before_img_capture,
                 "headless": args.headless,
                 "learning_rate": 3e-4,
