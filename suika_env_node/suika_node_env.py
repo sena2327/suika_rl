@@ -356,7 +356,7 @@ class SuikaNodeEnv(gymnasium.Env):
         self.score = score
         info = dict(out.get("info", {}))
         info["score"] = score
-        info["final_score_valid"] = bool(terminated)
+        info["final_score_valid"] = bool(terminated) and (not bool(info.get("discard_episode", False)))
 
         # Proactively recycle worker before long-run heap growth causes OOM.
         if self._worker_steps >= self._worker_recycle_steps:

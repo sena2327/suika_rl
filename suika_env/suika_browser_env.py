@@ -435,24 +435,15 @@ class SuikaBrowserEnv(gymnasium.Env):
             info['score'] = score
             info["final_score_valid"] = bool(terminal)
 
-            # Reward design:
-            #   merge reward: cherry=+0.1, strawberry=+0.2, ..., melon=+1.0
-            #   fruit-count penalty: 0.001 * fruit_count
-            #   height penalty: -x/100 where x is board height percent (max_height in [0,1] => 0.1*max_height)
-            #   gameover penalty: -2.0
+            # Reward design: merge score-value/20 + gameover penalty.
             merged_now = np.asarray(snapshot.get("merged_counts", [0.0] * 11), dtype=np.float32)
             merged_prev = getattr(self, "_prev_merged_counts", np.zeros(11, dtype=np.float32))
             merged_delta = np.maximum(merged_now - merged_prev, 0.0)
-            merge_reward_weights = np.minimum((np.arange(11, dtype=np.float32) + 1.0) * 0.1, 1.0)
-            merge_reward = float(np.sum(merged_delta * merge_reward_weights))
+            # Must match game score table in JS: [1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66]
+            merge_score_values = np.array([1, 3, 6, 10, 15, 21, 28, 36, 45, 55, 66], dtype=np.float32)
+            merge_reward = float(np.sum(merged_delta * merge_score_values))
             self._prev_merged_counts = merged_now
-
-            fruit_count = float(obs.get("fruit_count", np.array([0.0], dtype=np.float32))[0])
-            max_height = float(obs.get("max_height", np.array([0.0], dtype=np.float32))[0])
-            fruit_penalty = 0.001 * fruit_count
-            height_penalty = 0.1 * max_height
-            terminal_penalty = 2.0 if terminal else 0.0
-            reward = merge_reward - fruit_penalty - height_penalty - terminal_penalty
+            reward = (merge_reward / 20.0) + (-2.0 if terminal else 0.0)
             self.score = score
 
             return obs, reward, terminal, truncated, info

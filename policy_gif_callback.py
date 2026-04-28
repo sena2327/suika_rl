@@ -265,7 +265,7 @@ def _generate_policy_gif_worker(
                 obs = obs_list[i]
                 model_obs = _build_model_obs(obs, model, image_adapter=image_adapter)
                 sigma = _get_sigma(model, model_obs)
-                action, _ = model.predict(model_obs, deterministic=False)
+                action, _ = model.predict(model_obs, deterministic=True)
                 action = np.asarray(action).reshape(-1)
                 env_action, logged_x, logged_idx = _map_action_for_env(model, action, algo=algo)
                 obs2, reward, terminated, truncated, info = env.step(env_action)

@@ -18,6 +18,8 @@ const READY_POLL_MS = 20;
 const STABLE_POLLS_REQUIRED = 5;
 const STABLE_SPEED_THRESHOLD = 0.05;
 const STABLE_POSITION_DELTA_THRESHOLD = 0.5;
+const SCORE_DELTA_HARD_CAP = 1000.0;
+const STEP_REWARD_HARD_CAP = 20.0;
 
 const FRICTION = {
   friction: 0.006,
@@ -169,6 +171,18 @@ class SuikaCore {
         }
 
         if (bodyA.sizeIndex !== bodyB.sizeIndex) continue;
+        if (!Number.isFinite(bodyA.id) || !Number.isFinite(bodyB.id)) continue;
+        const aId = Number(bodyA.id);
+        const bId = Number(bodyB.id);
+        const k0 = aId < bId ? aId : bId;
+        const k1 = aId < bId ? bId : aId;
+        const pairKey = `${k0}-${k1}`;
+        if (this._stepSeenMergePairs && this._stepSeenMergePairs.has(pairKey)) {
+          continue;
+        }
+        if (this._stepSeenMergePairs) {
+          this._stepSeenMergePairs.add(pairKey);
+        }
 
         let newSize = bodyA.sizeIndex + 1;
         if (bodyA.circleRadius >= FRUIT_SIZES[FRUIT_SIZES.length - 1].radius) {
@@ -176,8 +190,8 @@ class SuikaCore {
         }
 
         this.fruitsMerged[bodyA.sizeIndex] += 1;
-        // Merge reward: cherry=0.1, strawberry=0.2, ..., melon=1.0 (capped at 1.0).
-        this._stepMergeReward += Math.min((Number(bodyA.sizeIndex) + 1) * 0.1, 1.0);
+        // Merge reward uses game score values (1,3,6,...,66) per merged size.
+        this._stepMergeReward += Number(FRUIT_SIZES[bodyA.sizeIndex].scoreValue) || 0.0;
         const midPosX = (bodyA.position.x + bodyB.position.x) / 2;
         const midPosY = (bodyA.position.y + bodyB.position.y) / 2;
 
@@ -352,6 +366,8 @@ class SuikaCore {
     this._stepLoseHits = 0;
     this._stepFirstLoseEvent = null;
     this._stepMergeReward = 0.0;
+    this._stepSeenMergePairs = new Set();
+    const prevScore = Number(this.score) || 0.0;
 
     const xCentered = clamp(Number(actionCentered) || 0, -1.0, 1.0);
     const xNorm = (xCentered + 1.0) * 0.5;
@@ -361,19 +377,32 @@ class SuikaCore {
     const actionPixelX = Math.floor(xNorm * WIDTH);
     this.addFruit(actionPixelX);
 
-    const terminated = this.stateIndex === GAME_STATES.LOSE;
+    let terminated = this.stateIndex === GAME_STATES.LOSE;
+    let truncated = false;
     const snap = this._snapshot();
-    const fruitCount = Number.isFinite(snap.fruit_count) ? Number(snap.fruit_count) : 0.0;
-    const maxHeight = Number.isFinite(snap.max_height) ? Number(snap.max_height) : 0.0;
-    const fruitPenalty = 0.001 * fruitCount;
-    const heightPenalty = 0.1 * maxHeight;
-    const terminalPenalty = terminated ? 2.0 : 0.0;
-    const reward = this._stepMergeReward - fruitPenalty - heightPenalty - terminalPenalty;
+    const scoreDelta = Number(snap.score) - prevScore;
+    // Reward design: merge reward/20 + gameover penalty.
+    let reward = (this._stepMergeReward / 20.0) + (terminated ? -2.0 : 0.0);
+    let discardEpisode = false;
+    let discardReason = "";
+    if (!Number.isFinite(scoreDelta) || scoreDelta > SCORE_DELTA_HARD_CAP) {
+      discardEpisode = true;
+      discardReason = `score_delta_outlier:${scoreDelta}`;
+    }
+    if (!Number.isFinite(reward) || reward > STEP_REWARD_HARD_CAP) {
+      discardEpisode = true;
+      discardReason = discardReason || `reward_outlier:${reward}`;
+    }
+    if (discardEpisode) {
+      reward = 0.0;
+      terminated = true;
+      truncated = true;
+    }
     return {
       ...snap,
       reward,
       terminated,
-      truncated: false,
+      truncated,
       info: {
         score: this.score,
         collision_pairs_step: this._stepCollisionPairs,
@@ -382,6 +411,9 @@ class SuikaCore {
         lose_height_triggered: this._stepLoseHits > 0 ? 1 : 0,
         lose_height: LOSE_HEIGHT,
         lose_event: this._stepFirstLoseEvent,
+        discard_episode: discardEpisode,
+        discard_reason: discardReason,
+        score_delta_step: scoreDelta,
       },
     };
   }
