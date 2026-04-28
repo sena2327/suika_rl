@@ -136,7 +136,7 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
     p.add_argument("--n-envs", type=int, default=16)
-    p.add_argument("--n-steps", type=int, default=128)
+    p.add_argument("--n-steps", type=int, default=512)
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
@@ -230,7 +230,7 @@ def main():
                 "learning_rate": 1e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
-                "batch_size": 256,
+                "batch_size": 1024,
                 "gamma": 0.99,
                 "gae_lambda": 0.95,
                 "clip_range": 0.2,
@@ -261,7 +261,7 @@ def main():
             ),
             learning_rate=1e-4,
             n_steps=effective_n_steps,
-            batch_size=256,
+            batch_size=1024,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,

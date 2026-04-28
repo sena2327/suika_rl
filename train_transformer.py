@@ -308,7 +308,7 @@ def parse_args():
         help="Training env id.",
     )
     p.add_argument("--n-envs", type=int, default=16)
-    p.add_argument("--n-steps", type=int, default=128)
+    p.add_argument("--n-steps", type=int, default=512)
     p.add_argument("--rollout-steps-total", type=int, default=4096)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--port-base", type=int, default=8923)
@@ -336,7 +336,7 @@ def parse_args():
     p.add_argument("--gif-dir", type=Path, default=Path("gifs/transformer"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--terminal-penalty", type=float, default=-2.0)
     p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()

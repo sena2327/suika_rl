@@ -369,7 +369,7 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--buffer-size", type=int, default=50_000)
     p.add_argument("--learning-starts", type=int, default=20_000)
-    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--gamma", type=float, default=0.99)
     p.add_argument("--tau", type=float, default=0.005)
     p.add_argument("--target-update-interval", type=int, default=1000)

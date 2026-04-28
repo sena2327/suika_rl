@@ -472,7 +472,7 @@ def parse_args():
     p.add_argument(
         "--n-steps",
         type=int,
-        default=128,
+        default=512,
         help="PPO rollout length per env before each update (smaller => more frequent logs).",
     )
     p.add_argument(
@@ -622,7 +622,7 @@ def main():
                 "learning_rate": 3e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
-                "batch_size": 256,
+                "batch_size": 1024,
                 "gamma": 0.99,
                 "gae_lambda": 0.95,
                 "clip_range": 0.2,
@@ -651,7 +651,7 @@ def main():
             policy_kwargs=policy_kwargs,
             learning_rate=3e-4,
             n_steps=effective_n_steps,
-            batch_size=256,
+            batch_size=1024,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
