@@ -15,6 +15,8 @@ const READY_DELAY_MS = 500;
 const READY_TIMEOUT_MS = 2000;
 const READY_POLL_MS = 20;
 const STABLE_POLLS_REQUIRED = 5;
+const STABLE_SPEED_THRESHOLD = 0.05;
+const STABLE_POSITION_DELTA_THRESHOLD = 0.5;
 
 const FRICTION = {
   friction: 0.006,
@@ -276,6 +278,7 @@ class SuikaCore {
     let previewShown = false;
     let stablePolls = 0;
     let lastScore = null;
+    let prevPositions = null;
     while (elapsed < READY_TIMEOUT_MS) {
       this._advance(READY_POLL_MS);
       elapsed += READY_POLL_MS;
@@ -286,7 +289,41 @@ class SuikaCore {
         previewShown = true;
       }
 
-      if (this.stateIndex !== GAME_STATES.DROP) {
+      // Wait for both score stability and low body velocities.
+      let maxSpeed = 0.0;
+      const curPositions = new Map();
+      const bodies = this.engine?.world?.bodies || [];
+      for (const b of bodies) {
+        if (!b || b.isStatic) continue;
+        const vx = Number.isFinite(b?.velocity?.x) ? b.velocity.x : 0.0;
+        const vy = Number.isFinite(b?.velocity?.y) ? b.velocity.y : 0.0;
+        const s = Math.hypot(vx, vy);
+        if (s > maxSpeed) maxSpeed = s;
+        if (Number.isFinite(b?.id) && Number.isFinite(b?.position?.x) && Number.isFinite(b?.position?.y)) {
+          curPositions.set(Number(b.id), [Number(b.position.x), Number(b.position.y)]);
+        }
+      }
+      const speedOk = maxSpeed <= STABLE_SPEED_THRESHOLD;
+      let positionOk = false;
+      if (prevPositions !== null && curPositions.size > 0) {
+        let hasCommon = false;
+        let maxDelta = 0.0;
+        for (const [id, pos] of curPositions.entries()) {
+          if (!prevPositions.has(id)) continue;
+          hasCommon = true;
+          const prev = prevPositions.get(id);
+          const dx = pos[0] - prev[0];
+          const dy = pos[1] - prev[1];
+          const d = Math.hypot(dx, dy);
+          if (d > maxDelta) maxDelta = d;
+        }
+        if (hasCommon) {
+          positionOk = maxDelta <= STABLE_POSITION_DELTA_THRESHOLD;
+        }
+      }
+      prevPositions = curPositions;
+
+      if (this.stateIndex !== GAME_STATES.DROP && (speedOk || positionOk)) {
         if (lastScore !== null && this.score === lastScore) {
           stablePolls += 1;
         } else {

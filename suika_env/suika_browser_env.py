@@ -29,8 +29,12 @@ class SuikaBrowserEnv(gymnasium.Env):
         wait_for_ready_on_step=False,
         ready_poll_interval=0.01,
         ready_timeout=2.0,
+        stable_velocity_threshold=0.05,
+        stable_velocity_polls=5,
+        stable_position_threshold=0.5,
         img_width=128,
         img_height=128,
+        bitmap_size=128,
         enable_image_observation=True,
     ) -> None:
         self.game_url = f"http://localhost:{port}/"
@@ -61,14 +65,20 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.wait_for_ready_on_step = wait_for_ready_on_step
         self.ready_poll_interval = ready_poll_interval
         self.ready_timeout = ready_timeout
+        self.stable_velocity_threshold = float(stable_velocity_threshold)
+        self.stable_velocity_polls = int(max(1, stable_velocity_polls))
+        self.stable_position_threshold = float(stable_position_threshold)
         self.img_width = int(img_width)
         self.img_height = int(img_height)
+        self.bitmap_size = int(bitmap_size)
         self.enable_image_observation = bool(enable_image_observation)
         self._blank_image = np.zeros((self.img_height, self.img_width, 4), dtype=np.uint8)
+        self._fruit_radii = np.array([24, 32, 40, 56, 64, 72, 84, 96, 128, 160, 192], dtype=np.float32)
         self._prev_merged_counts = np.zeros(11, dtype=np.float32)
         self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
+            'bitmap': gymnasium.spaces.Box(low=0, high=11, shape=(self.bitmap_size, self.bitmap_size),  dtype="uint8"),
             'current_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'next_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'current_fruit_x': gymnasium.spaces.Box(low=0, high=1, shape=(1,), dtype="float32"),
@@ -154,8 +164,10 @@ class SuikaBrowserEnv(gymnasium.Env):
         else:
             img = self._blank_image
         snapshot = self._query_game_snapshot()
+        bitmap = self._build_bitmap(snapshot)
         return dict(
             image=img,
+            bitmap=bitmap,
             current_fruit_type=np.array([snapshot["current_fruit_type"]], dtype=np.float32),
             next_fruit_type=np.array([snapshot["next_fruit_type"]], dtype=np.float32),
             current_fruit_x=np.array([snapshot["current_fruit_x"]], dtype=np.float32),
@@ -172,6 +184,34 @@ class SuikaBrowserEnv(gymnasium.Env):
             board_fruit_type=np.array(snapshot["board_fruit_type"], dtype=np.float32),
             board_fruit_mask=np.array(snapshot["board_fruit_mask"], dtype=np.float32),
         ), snapshot["status"], float(snapshot["score"]), snapshot
+
+    def _build_bitmap(self, snapshot):
+        n = self.bitmap_size
+        bitmap = np.zeros((n, n), dtype=np.uint8)
+        board_xy = np.asarray(snapshot["board_fruit_xy"], dtype=np.float32).reshape(-1, 2)
+        board_t = np.asarray(snapshot["board_fruit_type"], dtype=np.int32).reshape(-1)
+        board_m = np.asarray(snapshot["board_fruit_mask"], dtype=np.float32).reshape(-1)
+        for i in range(board_m.shape[0]):
+            if board_m[i] < 0.5:
+                continue
+            t = int(np.clip(board_t[i], 0, 10))
+            val = np.uint8(t + 1)
+            x = float(np.clip(board_xy[i, 0], 0.0, 1.0)) * (n - 1)
+            y = float(np.clip(board_xy[i, 1], 0.0, 1.0)) * (n - 1)
+            r = float(self._fruit_radii[t])
+            rx = max(1.0, r / 640.0 * (n - 1))
+            ry = max(1.0, r / 960.0 * (n - 1))
+            x0 = max(0, int(np.floor(x - rx)))
+            x1 = min(n - 1, int(np.ceil(x + rx)))
+            y0 = max(0, int(np.floor(y - ry)))
+            y1 = min(n - 1, int(np.ceil(y + ry)))
+            if x1 < x0 or y1 < y0:
+                continue
+            yy, xx = np.ogrid[y0 : y1 + 1, x0 : x1 + 1]
+            mask = (((xx - x) / rx) ** 2 + ((yy - y) / ry) ** 2) <= 1.0
+            patch = bitmap[y0 : y1 + 1, x0 : x1 + 1]
+            patch[mask] = np.maximum(patch[mask], val)
+        return bitmap
 
     def _query_game_snapshot(self):
         # Game object can be transiently unavailable right after reload/start.
@@ -367,6 +407,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             terminal = (status == 3) or (js_state == 3) or bool(end_visible)
             truncated = False 
             info['score'] = score
+            info["final_score_valid"] = bool(terminal)
 
             # Reward design:
             #   merge reward: cherry=+0.1, strawberry=+0.2, ..., melon=+1.0
@@ -397,6 +438,7 @@ class SuikaBrowserEnv(gymnasium.Env):
             info["discard_episode"] = True
             info["discard_reason"] = "browser_recovery"
             info["score"] = prev_score
+            info["final_score_valid"] = False
             self._restart_driver()
             obs, _ = self.reset()
             return obs, 0.0, True, True, info
@@ -404,25 +446,74 @@ class SuikaBrowserEnv(gymnasium.Env):
     def _wait_until_step_stable(self):
         # In the JS game, DROP state is 2.
         # Waiting only for state transition can be too early for score update,
-        # so we additionally wait until score stays unchanged for a short window.
+        # so we additionally wait until score stays unchanged and
+        # (speed is low OR body positions are stable).
         start = time.time()
         stable_polls = 0
         last_score = None
+        last_pos = None
         while True:
-            state, score = self.driver.execute_script("""
+            state, score, max_speed, pos_list = self.driver.execute_script("""
                 return [
                     Number.isFinite(window.Game?.stateIndex) ? window.Game.stateIndex : 0,
-                    Number.isFinite(window.Game?.score) ? window.Game.score : 0
+                    Number.isFinite(window.Game?.score) ? window.Game.score : 0,
+                    (() => {
+                        const engine = window.__suikaEngine;
+                        const bodies = engine?.world?.bodies || [];
+                        let m = 0.0;
+                        for (const b of bodies) {
+                            if (!b || b.isStatic) continue;
+                            const vx = Number.isFinite(b?.velocity?.x) ? b.velocity.x : 0.0;
+                            const vy = Number.isFinite(b?.velocity?.y) ? b.velocity.y : 0.0;
+                            const s = Math.hypot(vx, vy);
+                            if (s > m) m = s;
+                        }
+                        return m;
+                    })(),
+                    (() => {
+                        const engine = window.__suikaEngine;
+                        const bodies = engine?.world?.bodies || [];
+                        const out = [];
+                        for (const b of bodies) {
+                            if (!b || b.isStatic) continue;
+                            if (!Number.isFinite(b?.id) || !Number.isFinite(b?.position?.x) || !Number.isFinite(b?.position?.y)) continue;
+                            out.push([b.id, b.position.x, b.position.y]);
+                        }
+                        return out;
+                    })()
                 ];
             """)
 
-            if state != 2:
+            speed_ok = float(max_speed) <= self.stable_velocity_threshold
+            cur_pos = {}
+            if isinstance(pos_list, list):
+                for item in pos_list:
+                    if isinstance(item, list) and len(item) >= 3:
+                        try:
+                            cur_pos[int(item[0])] = (float(item[1]), float(item[2]))
+                        except Exception:
+                            pass
+            position_ok = False
+            if last_pos is not None and cur_pos:
+                common = set(last_pos.keys()).intersection(cur_pos.keys())
+                if common:
+                    max_delta = 0.0
+                    for bid in common:
+                        x0, y0 = last_pos[bid]
+                        x1, y1 = cur_pos[bid]
+                        d = float(np.hypot(x1 - x0, y1 - y0))
+                        if d > max_delta:
+                            max_delta = d
+                    position_ok = max_delta <= self.stable_position_threshold
+            last_pos = cur_pos
+
+            if state != 2 and (speed_ok or position_ok):
                 if last_score is not None and score == last_score:
                     stable_polls += 1
                 else:
                     stable_polls = 0
                 last_score = score
-                if stable_polls >= 5:
+                if stable_polls >= self.stable_velocity_polls:
                     return
             else:
                 stable_polls = 0

@@ -233,6 +233,13 @@ class FinalScoreLoggingCallback(BaseCallback):
             term_info = info.get("final_info", info)
             if bool(term_info.get("discard_episode", info.get("discard_episode", False))):
                 continue
+            final_score_valid = term_info.get("final_score_valid", info.get("final_score_valid", None))
+            if final_score_valid is False:
+                continue
+            if final_score_valid is None:
+                # Fallback for old envs: avoid truncated-only endings in final_score metric.
+                if bool(term_info.get("TimeLimit.truncated", info.get("TimeLimit.truncated", False))):
+                    continue
             score = term_info.get("score", info.get("score", None))
             if score is None:
                 continue

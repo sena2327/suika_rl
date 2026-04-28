@@ -119,6 +119,8 @@ def _build_model_obs(obs: dict, model, image_adapter: _ImageObsAdapter | None = 
     keys = model.observation_space.spaces.keys()
     model_obs = {}
     for k in keys:
+        if k not in obs:
+            raise KeyError(f"Missing observation key '{k}'. Available keys: {sorted(list(obs.keys()))}")
         v = obs[k]
         if k == "image" and image_adapter is not None:
             v = image_adapter.transform(v)
@@ -198,6 +200,7 @@ def _generate_policy_gif_worker(
     try:
         model = _load_model(model_path, algo=algo)
         image_adapter = _ImageObsAdapter(model)
+        obs_keys = set(model.observation_space.spaces.keys())
         gif_file = Path(gif_path)
         action_log_path = str(gif_file.with_name(f"{gif_file.stem}_action.txt"))
 
@@ -223,7 +226,26 @@ def _generate_policy_gif_worker(
             return env
 
         raw_envs = [make_eval_env(0)]
-        envs = raw_envs
+
+        # If model expects bitmap+hand_onehot (train_bitmap.py), apply the same wrapper for eval.
+        envs = []
+        for raw_env in raw_envs:
+            env = raw_env
+            if "bitmap" in obs_keys and "hand_onehot" in obs_keys:
+                from train_bitmap import SuikaBitmapFrameStackWrapper
+
+                bitmap_space = model.observation_space.spaces["bitmap"]
+                shp = tuple(int(v) for v in bitmap_space.shape)
+                # Support both HWC and CHW bitmap spaces.
+                if len(shp) == 3 and shp[0] <= 16 and shp[1] > 16 and shp[2] > 16:
+                    n_frames = int(shp[0])
+                    target_hw = (int(shp[1]), int(shp[2]))
+                else:
+                    n_frames = int(shp[2]) if len(shp) == 3 else 1
+                    target_hw = (int(shp[0]), int(shp[1])) if len(shp) >= 2 else (64, 64)
+                env = SuikaBitmapFrameStackWrapper(env, n_frames=n_frames, target_hw=target_hw)
+            envs.append(env)
+
         frames = []
         action_logs = []
         obs_list = []

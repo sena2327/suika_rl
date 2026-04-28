@@ -16,6 +16,7 @@ class SuikaNodeEnv(gymnasium.Env):
         self,
         img_width: int = 128,
         img_height: int = 128,
+        bitmap_size: int = 128,
         enable_image_observation: bool = False,
         gui: bool = False,
         gui_fps: float = 20.0,
@@ -27,6 +28,7 @@ class SuikaNodeEnv(gymnasium.Env):
     ) -> None:
         self.img_width = int(img_width)
         self.img_height = int(img_height)
+        self.bitmap_size = int(bitmap_size)
         self.enable_image_observation = bool(enable_image_observation)
         self.gui = bool(gui)
         self.gui_fps = float(max(gui_fps, 1e-6))
@@ -64,6 +66,7 @@ class SuikaNodeEnv(gymnasium.Env):
         self.observation_space = gymnasium.spaces.Dict(
             {
                 "image": gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4), dtype="uint8"),
+                "bitmap": gymnasium.spaces.Box(low=0, high=11, shape=(self.bitmap_size, self.bitmap_size), dtype="uint8"),
                 "current_fruit_type": gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
                 "next_fruit_type": gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
                 "current_fruit_x": gymnasium.spaces.Box(low=0, high=1, shape=(1,), dtype="float32"),
@@ -254,9 +257,11 @@ class SuikaNodeEnv(gymnasium.Env):
             )
         else:
             image = self._blank_image
+        bitmap = self._build_bitmap(snap)
         self._maybe_show_gui()
         return {
             "image": image,
+            "bitmap": bitmap,
             "current_fruit_type": np.array([snap["current_fruit_type"]], dtype=np.float32),
             "next_fruit_type": np.array([snap["next_fruit_type"]], dtype=np.float32),
             "current_fruit_x": np.array([snap["current_fruit_x"]], dtype=np.float32),
@@ -273,6 +278,34 @@ class SuikaNodeEnv(gymnasium.Env):
             "board_fruit_type": np.array(snap["board_fruit_type"], dtype=np.float32),
             "board_fruit_mask": np.array(snap["board_fruit_mask"], dtype=np.float32),
         }
+
+    def _build_bitmap(self, snap: dict[str, Any]) -> np.ndarray:
+        n = self.bitmap_size
+        bitmap = np.zeros((n, n), dtype=np.uint8)
+        board_xy = np.asarray(snap["board_fruit_xy"], dtype=np.float32).reshape(-1, 2)
+        board_t = np.asarray(snap["board_fruit_type"], dtype=np.int32).reshape(-1)
+        board_m = np.asarray(snap["board_fruit_mask"], dtype=np.float32).reshape(-1)
+        for i in range(board_m.shape[0]):
+            if board_m[i] < 0.5:
+                continue
+            t = int(np.clip(board_t[i], 0, 10))
+            val = np.uint8(t + 1)
+            x = float(np.clip(board_xy[i, 0], 0.0, 1.0)) * (n - 1)
+            y = float(np.clip(board_xy[i, 1], 0.0, 1.0)) * (n - 1)
+            r = float(self._fruit_radii[t])
+            rx = max(1.0, r / 640.0 * (n - 1))
+            ry = max(1.0, r / 960.0 * (n - 1))
+            x0 = max(0, int(np.floor(x - rx)))
+            x1 = min(n - 1, int(np.ceil(x + rx)))
+            y0 = max(0, int(np.floor(y - ry)))
+            y1 = min(n - 1, int(np.ceil(y + ry)))
+            if x1 < x0 or y1 < y0:
+                continue
+            yy, xx = np.ogrid[y0 : y1 + 1, x0 : x1 + 1]
+            mask = (((xx - x) / rx) ** 2 + ((yy - y) / ry) ** 2) <= 1.0
+            patch = bitmap[y0 : y1 + 1, x0 : x1 + 1]
+            patch[mask] = np.maximum(patch[mask], val)
+        return bitmap
 
     def restart_browser(self):
         self._rpc({"cmd": "restart"})
@@ -321,6 +354,7 @@ class SuikaNodeEnv(gymnasium.Env):
         self.score = score
         info = dict(out.get("info", {}))
         info["score"] = score
+        info["final_score_valid"] = bool(terminated)
 
         # Proactively recycle worker before long-run heap growth causes OOM.
         if self._worker_steps >= self._worker_recycle_steps:
@@ -328,6 +362,7 @@ class SuikaNodeEnv(gymnasium.Env):
             if not terminated:
                 truncated = True
                 info["worker_recycle_due"] = True
+                info["final_score_valid"] = False
 
         return obs, reward, terminated, truncated, info
 

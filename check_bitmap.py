@@ -1,29 +1,26 @@
 """
-Show current agent input with a live GUI.
+Show current environment screen and single-frame bitmap observation.
 
 Behavior:
   - Take one action every N seconds (default: 10s)
-  - Show game screen on the left
-  - Show current observation values on the right
+  - Left: real game screen
+  - Right: obs["bitmap"] (single frame, no stacking)
 
 Example:
-  uv run python check_input.py --env-id SuikaEnvNode-v0 --steps 30 --action-interval-sec 10
+  uv run python suika_rl/check_bitmap.py --env-id SuikaEnvNode-v0 --no-headless
 """
 
 from __future__ import annotations
 
 import argparse
 import time
-from pathlib import Path
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
-from PIL import Image
 
 import suika_env  # noqa: F401
 import suika_env_node  # noqa: F401
-from train import SuikaImageFrameStackWrapper, SuikaImageObsWrapper
 
 
 def parse_args():
@@ -34,16 +31,20 @@ def parse_args():
         default="SuikaEnvNode-v0",
         choices=["SuikaEnv-v0", "SuikaEnvNode-v0"],
     )
-    p.add_argument("--steps", type=int, default=20)
+    p.add_argument("--steps", type=int, default=30)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--action-interval-sec", type=float, default=10.0)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
     p.add_argument("--port", type=int, default=8923)
     p.add_argument("--node-bin", type=str, default="node")
-    p.add_argument("--img-size", type=int, default=64)
-    p.add_argument("--frame-stack", type=int, default=3)
     p.add_argument("--deterministic-x", type=float, default=0.0, help="Centered action in [-1, 1].")
+    p.add_argument(
+        "--grid-size",
+        type=int,
+        default=32,
+        help="Display bitmap as NxN numeric grid (nearest-neighbor).",
+    )
     return p.parse_args()
 
 
@@ -59,30 +60,37 @@ def get_canvas_frame(env) -> np.ndarray:
     return img
 
 
-def to_cnn_input_vis(image: np.ndarray) -> np.ndarray:
-    arr = np.asarray(image)
-    if arr.ndim == 2:
-        return np.clip(arr, 0, 255).astype(np.uint8)
-    if arr.ndim == 3 and arr.shape[2] == 1:
-        return np.clip(arr[:, :, 0], 0, 255).astype(np.uint8)
-    if arr.ndim == 3 and arr.shape[2] >= 3:
-        # Show exactly what goes into CNN (H, W, C) after wrappers.
-        return np.clip(arr[:, :, :3], 0, 255).astype(np.uint8)
-    return np.zeros((64, 64), dtype=np.uint8)
+def resize_nearest_2d(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+    src_h, src_w = arr.shape
+    ys = (np.arange(h) * src_h / h).astype(np.int32)
+    xs = (np.arange(w) * src_w / w).astype(np.int32)
+    ys = np.clip(ys, 0, src_h - 1)
+    xs = np.clip(xs, 0, src_w - 1)
+    return arr[ys[:, None], xs[None, :]]
+
+
+def bitmap_to_text_grid(bitmap: np.ndarray, grid_size: int) -> str:
+    n = max(4, int(grid_size))
+    small = resize_nearest_2d(bitmap, n, n)
+    lines = []
+    for r in range(n):
+        row = " ".join(f"{int(v):2d}" for v in small[r])
+        lines.append(row)
+    return "\n".join(lines)
 
 
 def main():
     args = parse_args()
-
     kwargs = dict(
         headless=args.headless,
         mute_sound=True,
         wait_for_ready_on_step=True,
         ready_poll_interval=0.02,
         ready_timeout=2.0,
-        enable_image_observation=True,
-        img_width=args.img_size,
-        img_height=args.img_size,
+        enable_image_observation=False,
+        bitmap_size=128,
+        img_width=128,
+        img_height=128,
     )
     if args.env_id == "SuikaEnv-v0":
         kwargs["port"] = args.port
@@ -91,42 +99,29 @@ def main():
         kwargs["node_bin"] = args.node_bin
 
     env = gym.make(args.env_id, **kwargs)
-    env = SuikaImageObsWrapper(env)
-    env = SuikaImageFrameStackWrapper(env, n_frames=args.frame_stack)
     obs, _ = env.reset(seed=args.seed)
-    out_dir = Path("check_input")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    saved_count = 0
 
-    def save_input_frame(img: np.ndarray):
-        nonlocal saved_count
-        if saved_count >= 10:
-            return
-        arr = np.asarray(img, dtype=np.uint8)
-        if arr.ndim == 2:
-            pil = Image.fromarray(arr, mode="L")
-        else:
-            pil = Image.fromarray(arr)
-        path = out_dir / f"frame_{saved_count:03d}.png"
-        pil.save(path)
-        saved_count += 1
-
-    fig, (ax_img, ax_obs) = plt.subplots(
+    fig, (ax_img, ax_bitmap) = plt.subplots(
         1, 2, figsize=(14, 7), gridspec_kw={"width_ratios": [1.7, 1.3]}
     )
-    fig.suptitle(f"check_input: {args.env_id}")
+    fig.suptitle(f"check_bitmap: {args.env_id}")
     ax_img.axis("off")
-    ax_obs.axis("off")
+    ax_bitmap.axis("off")
 
     frame = get_canvas_frame(env)
-    obs_img = to_cnn_input_vis(obs["image"])
-    save_input_frame(obs_img)
+    bitmap = np.asarray(obs["bitmap"], dtype=np.uint8)
+
     im = ax_img.imshow(frame)
-    if obs_img.ndim == 2:
-        im_obs = ax_obs.imshow(obs_img, cmap="gray", vmin=0, vmax=255, interpolation="nearest")
-    else:
-        im_obs = ax_obs.imshow(obs_img, interpolation="nearest")
-    ax_obs.set_title(f'CNN input obs["image"] shape={obs["image"].shape}')
+    ax_bitmap.set_title(f'obs["bitmap"] shape={bitmap.shape} -> grid {args.grid_size}x{args.grid_size}')
+    txt = ax_bitmap.text(
+        0.0,
+        1.0,
+        bitmap_to_text_grid(bitmap, args.grid_size),
+        va="top",
+        ha="left",
+        family="monospace",
+        fontsize=6,
+    )
 
     action_value = float(np.clip(args.deterministic_x, -1.0, 1.0))
     action = np.array([action_value], dtype=np.float32)
@@ -136,11 +131,13 @@ def main():
             obs, reward, terminated, truncated, info = env.step(action)
 
             frame = get_canvas_frame(env)
-            obs_img = to_cnn_input_vis(obs["image"])
-            save_input_frame(obs_img)
+            bitmap = np.asarray(obs["bitmap"], dtype=np.uint8)
             im.set_data(frame)
-            im_obs.set_data(obs_img)
-            ax_img.set_xlabel(f"step={step}  action_x={action_value:+.3f}")
+            txt.set_text(bitmap_to_text_grid(bitmap, args.grid_size))
+            ax_img.set_xlabel(
+                f"step={step} action_x={action_value:+.3f} "
+                f"reward={float(reward):+.4f} score={float(info.get('score', 0.0)):.1f}"
+            )
             plt.pause(0.001)
 
             if terminated or truncated:
@@ -151,7 +148,6 @@ def main():
     finally:
         env.close()
         plt.close(fig)
-    print(f"saved_input_frames={saved_count} dir={out_dir}")
 
 
 if __name__ == "__main__":
