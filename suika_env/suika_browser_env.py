@@ -16,8 +16,10 @@ import os
 # Pillow 10+ removed Image.ANTIALIAS.
 if hasattr(Image, "Resampling"):
     RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+    RESAMPLE_NEAREST = Image.Resampling.NEAREST
 else:
     RESAMPLE_LANCZOS = Image.ANTIALIAS
+    RESAMPLE_NEAREST = Image.NEAREST
 
 class SuikaBrowserEnv(gymnasium.Env):
     def __init__(
@@ -70,7 +72,8 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.stable_position_threshold = float(stable_position_threshold)
         self.img_width = int(img_width)
         self.img_height = int(img_height)
-        self.bitmap_size = int(bitmap_size)
+        # Bitmap observation is standardized to 64x64.
+        self.bitmap_size = 64
         self.enable_image_observation = bool(enable_image_observation)
         self._blank_image = np.zeros((self.img_height, self.img_width, 4), dtype=np.uint8)
         self._fruit_radii = np.array([24, 32, 40, 56, 64, 72, 84, 96, 128, 160, 192], dtype=np.float32)
@@ -84,7 +87,7 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.driver = self._create_driver()
         _obs_dict = {
             'image': gymnasium.spaces.Box(low=0, high=255, shape=(self.img_height, self.img_width, 4),  dtype="uint8"),
-            'bitmap': gymnasium.spaces.Box(low=0, high=11, shape=(self.bitmap_size, self.bitmap_size),  dtype="uint8"),
+            'bitmap': gymnasium.spaces.Box(low=-1, high=11, shape=(self.bitmap_size, self.bitmap_size),  dtype="int8"),
             'board_top50_exyir': gymnasium.spaces.Box(low=0, high=256, shape=(50, 5), dtype="float32"),
             'current_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'next_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
@@ -305,8 +308,14 @@ class SuikaBrowserEnv(gymnasium.Env):
         return node, node_mask, edge, edge_index, edge_mask
 
     def _build_bitmap(self, snapshot):
-        n = self.bitmap_size
-        bitmap = np.zeros((n, n), dtype=np.uint8)
+        # 1) Build semantic map on 640x800 (W x H).
+        map_w, map_h = 640, 800
+        full = np.zeros((map_h, map_w), dtype=np.int8)
+        # Borders: left/right/top/bottom as -1.
+        full[0, :] = -1
+        full[-1, :] = -1
+        full[:, 0] = -1
+        full[:, -1] = -1
         board_xy = np.asarray(snapshot["board_fruit_xy"], dtype=np.float32).reshape(-1, 2)
         board_t = np.asarray(snapshot["board_fruit_type"], dtype=np.int32).reshape(-1)
         board_m = np.asarray(snapshot["board_fruit_mask"], dtype=np.float32).reshape(-1)
@@ -314,23 +323,32 @@ class SuikaBrowserEnv(gymnasium.Env):
             if board_m[i] < 0.5:
                 continue
             t = int(np.clip(board_t[i], 0, 10))
-            val = np.uint8(t + 1)
-            x = float(np.clip(board_xy[i, 0], 0.0, 1.0)) * (n - 1)
-            y = float(np.clip(board_xy[i, 1], 0.0, 1.0)) * (n - 1)
+            val = np.int8(t + 1)
+            x = float(np.clip(board_xy[i, 0], 0.0, 1.0)) * (map_w - 1)
+            y = float(np.clip(board_xy[i, 1], 0.0, 1.0)) * (map_h - 1)
             r = float(self._fruit_radii[t])
-            rx = max(1.0, r / 640.0 * (n - 1))
-            ry = max(1.0, r / 960.0 * (n - 1))
+            rx = max(1.0, r)
+            ry = max(1.0, r * (map_h / 960.0))
             x0 = max(0, int(np.floor(x - rx)))
-            x1 = min(n - 1, int(np.ceil(x + rx)))
+            x1 = min(map_w - 1, int(np.ceil(x + rx)))
             y0 = max(0, int(np.floor(y - ry)))
-            y1 = min(n - 1, int(np.ceil(y + ry)))
+            y1 = min(map_h - 1, int(np.ceil(y + ry)))
             if x1 < x0 or y1 < y0:
                 continue
             yy, xx = np.ogrid[y0 : y1 + 1, x0 : x1 + 1]
             mask = (((xx - x) / rx) ** 2 + ((yy - y) / ry) ** 2) <= 1.0
-            patch = bitmap[y0 : y1 + 1, x0 : x1 + 1]
+            patch = full[y0 : y1 + 1, x0 : x1 + 1]
             patch[mask] = np.maximum(patch[mask], val)
-        return bitmap
+        # 2) Keep aspect ratio and resize to 51x64 (W x H) with nearest.
+        resized = Image.fromarray(full.astype(np.int32), mode="I").resize((51, 64), RESAMPLE_NEAREST)
+        arr = np.asarray(resized, dtype=np.int16)
+        arr = np.clip(arr, -1, 11).astype(np.int8)
+        # 3) Pad left/right with 0 to reach 64x64.
+        pad_total = 64 - arr.shape[1]
+        pad_left = pad_total // 2
+        pad_right = pad_total - pad_left
+        arr = np.pad(arr, ((0, 0), (pad_left, pad_right)), mode="constant", constant_values=0)
+        return arr
 
     def _query_game_snapshot(self):
         # Game object can be transiently unavailable right after reload/start.

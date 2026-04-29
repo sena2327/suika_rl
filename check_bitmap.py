@@ -109,7 +109,7 @@ def main():
     ax_bitmap.axis("off")
 
     frame = get_canvas_frame(env)
-    bitmap = np.asarray(obs["bitmap"], dtype=np.uint8)
+    bitmap = np.asarray(obs["bitmap"], dtype=np.int8)
 
     im = ax_img.imshow(frame)
     ax_bitmap.set_title(f'obs["bitmap"] shape={bitmap.shape} -> grid {args.grid_size}x{args.grid_size}')
@@ -131,7 +131,7 @@ def main():
             obs, reward, terminated, truncated, info = env.step(action)
 
             frame = get_canvas_frame(env)
-            bitmap = np.asarray(obs["bitmap"], dtype=np.uint8)
+            bitmap = np.asarray(obs["bitmap"], dtype=np.int8)
             im.set_data(frame)
             txt.set_text(bitmap_to_text_grid(bitmap, args.grid_size))
             ax_img.set_xlabel(

@@ -66,10 +66,20 @@ $$
 
 ---
 
+# 実験基本設定
+
+- 環境: `SuikaEnvNode-v0`（Node.js 実装）
+- アルゴリズム: PPO（連続行動）
+- 使用ライブラリ : stable_baselines3
+- 行動範囲: `x ∈ [-1, 1]`
+- 学習長: `total_timesteps = 1,000,000`
+- ログ: Weights & Biases + TensorBoard
+
+---
+
 # 実験1
 
-
-入力
+- 画像入力よりもゲーム情報をそのまま使った方が早く終わりそう
 - 上位50個のフルーツの`x,y,r,one-hot-id`
 - `current_fruit_type`, `next_fruit_type`（one-hot）
 
@@ -90,10 +100,62 @@ $$
 
 ---
 
+# 結果
+
+- およそ100万ステップ（ローカルPCで６時間程度）
+- エピソード報酬/最終スコアは改善傾向に
+
+<div class="flex items-center justify-center gap-4 my-2">
+  <img
+    src="/assets/mlp_reward.png"
+    alt="mlp reward"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+  <img
+    src="/assets/mlp_score.png"
+    alt="mlp score"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+</div>
+
+
+ただ、端を積み上げるという局所解から抜け出せなかった
+
+---
+
+# MLP の挙動比較（初期 vs 最終）
+
+- 点数は低いが、少しだけ方策の発露が見える
+
+<div class="grid grid-cols-2 gap-4 items-center">
+  <div class="text-center">
+    <div class="mb-2 font-semibold">初期方策</div>
+    <img
+      src="/assets/mlp_first.gif"
+      alt="mlp first policy"
+      class="rounded shadow mx-auto"
+      style="width: 90%; max-height: 360px; object-fit: contain;"
+    />
+  </div>
+  <div class="text-center">
+    <div class="mb-2 font-semibold">最終方策</div>
+    <img
+      src="/assets/mlp-fianl.gif"
+      alt="mlp final policy"
+      class="rounded shadow mx-auto"
+      style="width: 90%; max-height: 360px; object-fit: contain;"
+    />
+  </div>
+</div>
+
+---
+
 # 実験2
 
-入力
-- `64x64 RGB`（1フレーム）
+- 画像にしたらもう少し良くなるのでは？
+- `64x64 RGBx1`(グレースケールだとフルーツの違いが分かりにくいので)
 - `current_fruit_type`, `next_fruit_type`（one-hot連結）
 
 <div class="flex items-center justify-center my-2">
@@ -105,16 +167,43 @@ $$
   />
 </div>
 
-基本設定（今回の実装）
+基本設定
 - 報酬: `merge score / 20` + `gameover penalty -2`
 - PPO: `n_envs=16`, `n_steps=512`, `batch_size=1024`, `lr=3e-4`
 - 行動: 連続値 `x ∈ [-1, 1]`
 
 ---
 
+# 結果
+
+- およそ100万ステップ（owl1で15時間程度,なぜかローカルの方が早い）
+- エピソード報酬/最終スコアに改善傾向は見られなかった
+- ステップ数の不足により画像の特徴量を捉えられなかった？
+
+<div class="flex items-center justify-center gap-4 my-2">
+  <img
+    src="/assets/cnn-reward.png"
+    alt="mlp reward"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+  <img
+    src="/assets/cnn-score.png"
+    alt="mlp score"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+</div>
+
+
+ただ、中心に落とし続けることしかしなかった
+
+
+---
+
 # 実験3
 
-入力グラフ
+- 画像よりは情報量を絞りつつも、単純なmlpよりも構造を捉えたい -> GNNの採用
 - Node: `[x, y, radius_norm, one-hot(type)]`
 - Edge: `[dx, dy, distance, is_sametype, is_touching, overlap_margin]`
 - `k=8` + `distance < threshold` で疎グラフ化
@@ -128,7 +217,43 @@ $$
   />
 </div>
 
-基本設定（今回の実装）
+基本設定
 - モデル: Node encoder → 3層Residual GNN → mean/max pooling
 - PPO: `n_envs=8`, `n_steps=512`, `batch_size=256`, `lr=1e-4`
 - 行動: 連続値 `x ∈ [-1, 1]`
+
+---
+
+# 結果
+- およそ100万ステップ（ローカルで12時間程度）
+- エピソード報酬/最終スコアに改善傾向はほぼ見られなかった
+- 学習が足りない可能性大
+
+
+<div class="flex items-center justify-center gap-4 my-2">
+  <img
+    src="/assets/gnn-reward.png"
+    alt="mlp reward"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+  <img
+    src="/assets/gnn-score.png"
+    alt="mlp score"
+    class="rounded shadow"
+    style="width: 48%;"
+  />
+</div>
+
+---
+
+# 結論
+
+- 人間のスコアが2000~2500 >> RLの結果
+- 学習が足りない可能性
+- タスクが単純に難しい(取れる方策に対して状態数が非常に多い)
+
+# 感想
+
+- 報酬の設計が難しい
+- サンプル数を稼ぐために環境のレイテンシが非常に重要

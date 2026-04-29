@@ -1,17 +1,17 @@
 """
-PPO training (Bitmap 3-frame + CoordConv) for SuikaEnv-v0 / SuikaEnvNode-v0.
+PPO training (Bitmap + hand one-hot) for SuikaEnv-v0 / SuikaEnvNode-v0.
 
 Input design:
-  - bitmap: 3 stacked bitmap frames, nearest-neighbor resized to 64x64
+  - bitmap: 64x64 single-frame semantic map from obs["bitmap"]
   - hand_onehot: concat(one-hot(current_fruit_type), one-hot(next_fruit_type))
-  - extractor appends CoordConv (x,y), so CNN input becomes [64,64,5] when frame_stack=3
+  - extractor: CNN(board_feature) + hand concat -> PPO
+  - actor/critic use separate feature extractors (share_features_extractor=False)
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-from collections import deque
 from pathlib import Path
 from typing import Callable
 
@@ -41,22 +41,20 @@ from train import (
 )
 
 
-class SuikaBitmapFrameStackWrapper(gym.Wrapper):
+class SuikaBitmapObsWrapper(gym.ObservationWrapper):
     """Build bitmap+hand observation for PPO from env raw observation."""
 
-    def __init__(self, env: gym.Env, n_frames: int = 3, target_hw: tuple[int, int] = (64, 64)):
+    def __init__(self, env: gym.Env, target_hw: tuple[int, int] = (64, 64)):
         super().__init__(env)
-        self.n_frames = max(1, int(n_frames))
         self.target_h, self.target_w = int(target_hw[0]), int(target_hw[1])
-        self._frames = deque(maxlen=self.n_frames)
         self._n_fruit_types = 11
         self.observation_space = spaces.Dict(
             {
                 "bitmap": spaces.Box(
-                    low=0,
+                    low=-1,
                     high=self._n_fruit_types,
-                    shape=(self.target_h, self.target_w, self.n_frames),
-                    dtype=np.uint8,
+                    shape=(self.target_h, self.target_w, 1),
+                    dtype=np.int8,
                 ),
                 "hand_onehot": spaces.Box(
                     low=0.0,
@@ -67,7 +65,7 @@ class SuikaBitmapFrameStackWrapper(gym.Wrapper):
             }
         )
 
-    def _resize_nearest_u8(self, img_hw: np.ndarray) -> np.ndarray:
+    def _resize_nearest(self, img_hw: np.ndarray) -> np.ndarray:
         src_h, src_w = img_hw.shape
         ys = (np.arange(self.target_h) * src_h / self.target_h).astype(np.int32)
         xs = (np.arange(self.target_w) * src_w / self.target_w).astype(np.int32)
@@ -84,32 +82,18 @@ class SuikaBitmapFrameStackWrapper(gym.Wrapper):
         return one
 
     def _get_frame(self, obs: dict) -> np.ndarray:
-        bitmap = np.asarray(obs["bitmap"], dtype=np.uint8)
+        bitmap = np.asarray(obs["bitmap"], dtype=np.int8)
         if bitmap.ndim != 2:
             raise ValueError(f'Expected obs["bitmap"] shape=(H,W), got {bitmap.shape}')
-        return self._resize_nearest_u8(bitmap)
+        return self._resize_nearest(bitmap)
 
-    def _pack_obs(self, obs: dict) -> dict:
-        if len(self._frames) != self.n_frames:
-            raise RuntimeError("frame buffer is not initialized")
-        stacked = np.stack(list(self._frames), axis=2)  # (H, W, n_frames)
+    def observation(self, obs: dict) -> dict:
+        frame = self._get_frame(obs)
+        frame = np.expand_dims(frame, axis=2)  # (H, W, 1)
         return {
-            "bitmap": stacked,
+            "bitmap": frame,
             "hand_onehot": self._build_hand_onehot(obs),
         }
-
-    def reset(self, **kwargs):
-        obs, info = self.env.reset(**kwargs)
-        frame = self._get_frame(obs)
-        self._frames.clear()
-        for _ in range(self.n_frames):
-            self._frames.append(frame.copy())
-        return self._pack_obs(obs), info
-
-    def step(self, action):
-        obs, reward, terminated, truncated, info = self.env.step(action)
-        self._frames.append(self._get_frame(obs).copy())
-        return self._pack_obs(obs), reward, terminated, truncated, info
 
 
 class SuikaBitmapCoordConvExtractor(BaseFeaturesExtractor):
@@ -144,7 +128,8 @@ class SuikaBitmapCoordConvExtractor(BaseFeaturesExtractor):
         )
         with th.no_grad():
             sample = th.as_tensor(bitmap_space.sample()[None]).float()  # (B,H,W,C)
-            sample = sample.permute(0, 3, 1, 2).contiguous() / self._bitmap_norm
+            sample = sample.permute(0, 3, 1, 2).contiguous()
+            sample = self._normalize_bitmap(sample)
             sample = self._append_coord_channels(sample)
             n_flatten = int(self.cnn(sample).shape[1])
         self.bitmap_head = nn.Sequential(nn.Linear(n_flatten, 224), nn.ReLU())
@@ -160,9 +145,18 @@ class SuikaBitmapCoordConvExtractor(BaseFeaturesExtractor):
         x_map = x_lin.view(1, 1, 1, w).expand(b, 1, h, w)
         return th.cat([bitmap, x_map, y_map], dim=1)
 
+    def _normalize_bitmap(self, bitmap: th.Tensor) -> th.Tensor:
+        """
+        Normalize fruit ids only:
+          1..11 -> /11
+          0 (empty) and -1 (border) are kept as-is.
+        """
+        return th.where(bitmap > 0.0, bitmap / self._bitmap_norm, bitmap)
+
     def forward(self, observations):
-        bitmap = observations["bitmap"].float() / self._bitmap_norm  # (B,H,W,C)
+        bitmap = observations["bitmap"].float()  # (B,H,W,C)
         bitmap = bitmap.permute(0, 3, 1, 2).contiguous()  # (B,C,H,W)
+        bitmap = self._normalize_bitmap(bitmap)
         bitmap = self._append_coord_channels(bitmap)  # (B,C+2,H,W) -> [64,64,5] when C=3
         bitmap_feat = self.bitmap_head(self.cnn(bitmap))
         hand_feat = self.hand_head(observations["hand_onehot"].float())
@@ -175,7 +169,6 @@ def make_env_bitmap(
     headless: bool,
     port_base: int,
     env_id: str,
-    frame_stack: int,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env_kwargs = dict(
@@ -193,7 +186,7 @@ def make_env_bitmap(
         if env_id == "SuikaEnv-v0":
             env_kwargs["port"] = port_base + rank
         env = gym.make(env_id, **env_kwargs)
-        env = SuikaBitmapFrameStackWrapper(env, n_frames=frame_stack, target_hw=(64, 64))
+        env = SuikaBitmapObsWrapper(env, target_hw=(64, 64))
         return env
 
     return _init
@@ -206,7 +199,6 @@ def parse_args():
     p.add_argument("--n-steps", type=int, default=512)
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--bitmap-frame-stack", type=int, default=3)
     p.add_argument(
         "--env-id",
         type=str,
@@ -261,7 +253,6 @@ def main():
             args.headless,
             args.port_base,
             args.env_id,
-            args.bitmap_frame_stack,
         )
         for i in range(args.n_envs)
     ]
@@ -295,7 +286,7 @@ def main():
                 "total_timesteps": args.total_timesteps,
                 "n_envs": args.n_envs,
                 "seed": args.seed,
-                "bitmap_frame_stack": args.bitmap_frame_stack,
+                "bitmap_frame_stack": 1,
                 "learning_rate": 3e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
@@ -324,7 +315,10 @@ def main():
         model = PPO(
             "MultiInputPolicy",
             vec_env,
-            policy_kwargs=dict(features_extractor_class=SuikaBitmapCoordConvExtractor),
+            policy_kwargs=dict(
+                features_extractor_class=SuikaBitmapCoordConvExtractor,
+                share_features_extractor=False,
+            ),
             learning_rate=1e-4,
             n_steps=effective_n_steps,
             batch_size=1024,
