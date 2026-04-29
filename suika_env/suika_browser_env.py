@@ -74,6 +74,12 @@ class SuikaBrowserEnv(gymnasium.Env):
         self.enable_image_observation = bool(enable_image_observation)
         self._blank_image = np.zeros((self.img_height, self.img_width, 4), dtype=np.uint8)
         self._fruit_radii = np.array([24, 32, 40, 56, 64, 72, 84, 96, 128, 160, 192], dtype=np.float32)
+        self._graph_max_nodes = 50
+        self._graph_node_dim = 14  # [x, y, radius_norm, one-hot(11)]
+        self._graph_knn_k = 8
+        self._graph_dist_threshold = 0.35
+        self._graph_touch_margin_px = 2.0
+        self._graph_max_edges = (self._graph_max_nodes * (self._graph_max_nodes - 1)) // 2
         self._prev_merged_counts = np.zeros(11, dtype=np.float32)
         self.driver = self._create_driver()
         _obs_dict = {
@@ -90,11 +96,18 @@ class SuikaBrowserEnv(gymnasium.Env):
             'danger_count': gymnasium.spaces.Box(low=0, high=500, shape=(1,), dtype="float32"),
             'largest_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(1,), dtype="float32"),
             'fruit_count': gymnasium.spaces.Box(low=0, high=500, shape=(1,), dtype="float32"),
+            'global_feature': gymnasium.spaces.Box(low=0, high=1, shape=(4,), dtype="float32"),
+            'largest_type_onehot': gymnasium.spaces.Box(low=0, high=1, shape=(11,), dtype="float32"),
             'board_fruit_xy': gymnasium.spaces.Box(low=0, high=1, shape=(80,), dtype="float32"),
             'board_fruit_radius': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
             'board_fruit_mass': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
             'board_fruit_type': gymnasium.spaces.Box(low=0, high=10, shape=(40,), dtype="float32"),
             'board_fruit_mask': gymnasium.spaces.Box(low=0, high=1, shape=(40,), dtype="float32"),
+            'node': gymnasium.spaces.Box(low=-1, high=1, shape=(self._graph_max_nodes, self._graph_node_dim), dtype="float32"),
+            'node_mask': gymnasium.spaces.Box(low=0, high=1, shape=(self._graph_max_nodes,), dtype="float32"),
+            'edge': gymnasium.spaces.Box(low=-2, high=2, shape=(self._graph_max_edges, 6), dtype="float32"),
+            'edge_index': gymnasium.spaces.Box(low=0, high=self._graph_max_nodes - 1, shape=(self._graph_max_edges, 2), dtype="int32"),
+            'edge_mask': gymnasium.spaces.Box(low=0, high=1, shape=(self._graph_max_edges,), dtype="float32"),
         }
         self.observation_space = gymnasium.spaces.Dict(_obs_dict)
         self.action_space = gymnasium.spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32)
@@ -166,6 +179,8 @@ class SuikaBrowserEnv(gymnasium.Env):
             img = self._blank_image
         snapshot = self._query_game_snapshot()
         bitmap = self._build_bitmap(snapshot)
+        node_feat, node_mask, edge_feat, edge_index, edge_mask = self._build_graph_from_top50(snapshot["board_top50_exyir"])
+        global_feature, largest_type_onehot = self._build_global_feature(snapshot)
         return dict(
             image=img,
             bitmap=bitmap,
@@ -180,12 +195,114 @@ class SuikaBrowserEnv(gymnasium.Env):
             danger_count=np.array([snapshot["danger_count"]], dtype=np.float32),
             largest_fruit_type=np.array([snapshot["largest_fruit_type"]], dtype=np.float32),
             fruit_count=np.array([snapshot["fruit_count"]], dtype=np.float32),
+            global_feature=global_feature,
+            largest_type_onehot=largest_type_onehot,
             board_fruit_xy=np.array(snapshot["board_fruit_xy"], dtype=np.float32),
             board_fruit_radius=np.array(snapshot["board_fruit_radius"], dtype=np.float32),
             board_fruit_mass=np.array(snapshot["board_fruit_mass"], dtype=np.float32),
             board_fruit_type=np.array(snapshot["board_fruit_type"], dtype=np.float32),
             board_fruit_mask=np.array(snapshot["board_fruit_mask"], dtype=np.float32),
+            node=node_feat,
+            node_mask=node_mask,
+            edge=edge_feat,
+            edge_index=edge_index,
+            edge_mask=edge_mask,
         ), snapshot["status"], float(snapshot["score"]), snapshot
+
+    def _build_global_feature(self, snapshot):
+        board_xy = np.asarray(snapshot["board_fruit_xy"], dtype=np.float32).reshape(-1, 2)
+        board_mask = np.asarray(snapshot["board_fruit_mask"], dtype=np.float32).reshape(-1)
+        board_type = np.asarray(snapshot["board_fruit_type"], dtype=np.float32).reshape(-1)
+        valid = board_mask > 0.5
+        if np.any(valid):
+            x_vals = board_xy[valid, 0]
+            x_mean = float(np.clip(np.mean(x_vals), 0.0, 1.0))
+            x_var = float(np.clip(np.var(x_vals), 0.0, 1.0))
+            largest_idx = int(np.clip(np.max(board_type[valid]), 0.0, 10.0))
+        else:
+            x_mean = 0.5
+            x_var = 0.0
+            largest_idx = 0
+        fruit_count = float(np.clip(float(snapshot.get("fruit_count", 0.0)) / 50.0, 0.0, 1.0))
+        max_height = float(np.clip(float(snapshot.get("max_height", 0.0)), 0.0, 1.0))
+        largest_onehot = np.zeros((11,), dtype=np.float32)
+        largest_onehot[largest_idx] = 1.0
+        return np.array([fruit_count, max_height, x_mean, x_var], dtype=np.float32), largest_onehot
+
+    def _build_graph_from_top50(self, top50):
+        arr = np.asarray(top50, dtype=np.float32).reshape(self._graph_max_nodes, 5)
+        # Reorder nodes by y (top to bottom), then pad with zeros.
+        valid = arr[:, 0] > 0.5
+        valid_arr = arr[valid]
+        if valid_arr.shape[0] > 0:
+            order = np.argsort(valid_arr[:, 2], kind="stable")
+            valid_arr = valid_arr[order]
+        arr_sorted = np.zeros_like(arr)
+        n_valid = min(valid_arr.shape[0], self._graph_max_nodes)
+        if n_valid > 0:
+            arr_sorted[:n_valid] = valid_arr[:n_valid]
+        arr = arr_sorted
+        exist = arr[:, 0] > 0.5
+        x = arr[:, 1]
+        y = arr[:, 2]
+        fruit_id = np.clip(arr[:, 3].astype(np.int32), 0, 11)  # 0 padding, 1..11 real
+        radius_px = np.clip(arr[:, 4], 0.0, 256.0)
+
+        node = np.zeros((self._graph_max_nodes, self._graph_node_dim), dtype=np.float32)
+        node[:, 0] = x
+        node[:, 1] = y
+        node[:, 2] = np.clip(radius_px / 256.0, 0.0, 1.0)
+        for i in range(self._graph_max_nodes):
+            if not exist[i]:
+                continue
+            fid0 = int(np.clip(fruit_id[i] - 1, 0, 10))
+            node[i, 3 + fid0] = 1.0
+        node_mask = exist.astype(np.float32)
+
+        edge = np.zeros((self._graph_max_edges, 6), dtype=np.float32)
+        edge_index = np.zeros((self._graph_max_edges, 2), dtype=np.int32)
+        edge_mask = np.zeros((self._graph_max_edges,), dtype=np.float32)
+        valid_idx = np.flatnonzero(exist).astype(np.int32)
+        keep_pairs = set()
+        if valid_idx.size >= 2:
+            for i in valid_idx.tolist():
+                dx_all = x[valid_idx] - x[i]
+                dy_all = y[valid_idx] - y[i]
+                d2_all = dx_all * dx_all + dy_all * dy_all
+                d_all = np.sqrt(d2_all)
+                order = np.argsort(d2_all)
+                chosen = 0
+                for oi in order:
+                    j = int(valid_idx[oi])
+                    if j == i:
+                        continue
+                    if float(d_all[oi]) >= self._graph_dist_threshold:
+                        continue
+                    a, b = (i, j) if i < j else (j, i)
+                    keep_pairs.add((a, b))
+                    chosen += 1
+                    if chosen >= self._graph_knn_k:
+                        break
+        k = 0
+        for i in range(self._graph_max_nodes):
+            for j in range(i + 1, self._graph_max_nodes):
+                edge_index[k, 0] = i
+                edge_index[k, 1] = j
+                if (i, j) in keep_pairs:
+                    dx = x[j] - x[i]
+                    dy = y[j] - y[i]
+                    dist = float(np.sqrt(dx * dx + dy * dy))
+                    same_type = 1.0 if fruit_id[i] == fruit_id[j] else 0.0
+                    xi, yi = x[i] * 640.0, y[i] * 960.0
+                    xj, yj = x[j] * 640.0, y[j] * 960.0
+                    dpx = float(np.sqrt((xj - xi) ** 2 + (yj - yi) ** 2))
+                    touching = 1.0 if dpx <= (radius_px[i] + radius_px[j] + self._graph_touch_margin_px) else 0.0
+                    overlap_margin = float((radius_px[i] + radius_px[j]) - dpx)
+                    overlap_margin_norm = float(np.clip(overlap_margin / 256.0, -2.0, 2.0))
+                    edge[k] = np.array([dx, dy, dist, same_type, touching, overlap_margin_norm], dtype=np.float32)
+                    edge_mask[k] = 1.0
+                k += 1
+        return node, node_mask, edge, edge_index, edge_mask
 
     def _build_bitmap(self, snapshot):
         n = self.bitmap_size

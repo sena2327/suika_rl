@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="560" viewBox="0 0 1200 560">
+  <defs>
+    <style>
+      .title { font: 700 34px 'Helvetica Neue', Arial, sans-serif; fill: #111827; }
+      .box { fill: #f8fafc; stroke: #334155; stroke-width: 2; rx: 14; ry: 14; }
+      .txt { font: 700 20px 'Helvetica Neue', Arial, sans-serif; fill: #0f172a; }
+      .sub { font: 500 16px 'Helvetica Neue', Arial, sans-serif; fill: #334155; }
+      .arr { stroke: #1e293b; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .note { font: 600 15px 'Helvetica Neue', Arial, sans-serif; fill: #0f172a; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#1e293b" />
+    </marker>
+  </defs>
+
+  <rect x="0" y="0" width="1200" height="560" fill="#ffffff"/>
+  <text x="60" y="58" class="title">PPO (A2C Focused) : Actor-Critic Update Flow</text>
+
+  <rect x="70" y="120" width="220" height="120" class="box"/>
+  <text x="130" y="168" class="txt">Environment</text>
+  <text x="95" y="200" class="sub">s_t, r_t, done を返す</text>
+
+  <rect x="340" y="120" width="240" height="120" class="box"/>
+  <text x="390" y="160" class="txt">Actor (Policy)</text>
+  <text x="385" y="190" class="sub">a_t ~ π_θ(a|s_t)</text>
+  <text x="385" y="214" class="sub">log π_θ(a_t|s_t)</text>
+
+  <rect x="620" y="120" width="240" height="120" class="box"/>
+  <text x="685" y="160" class="txt">Critic (Value)</text>
+  <text x="680" y="190" class="sub">V_φ(s_t) を推定</text>
+
+  <rect x="900" y="120" width="230" height="120" class="box"/>
+  <text x="940" y="160" class="txt">GAE / Return</text>
+  <text x="935" y="190" class="sub">Â_t, R_t を計算</text>
+
+  <rect x="280" y="320" width="640" height="170" class="box"/>
+  <text x="520" y="362" class="txt">PPO Objective (Actor-Critic)</text>
+  <text x="330" y="392" class="sub">Policy: clip(r_t(θ), 1-ε, 1+ε) * Â_t</text>
+  <text x="330" y="418" class="sub">Value: (R_t - V_φ(s_t))^2</text>
+  <text x="330" y="444" class="sub">Entropy bonus で探索を維持</text>
+
+  <path d="M290 180 L340 180" class="arr"/>
+  <path d="M580 180 L620 180" class="arr"/>
+  <path d="M860 180 L900 180" class="arr"/>
+
+  <path d="M460 240 L460 320" class="arr"/>
+  <path d="M740 240 L740 320" class="arr"/>
+  <path d="M1015 240 L820 320" class="arr"/>
+
+  <path d="M350 320 L200 240" class="arr"/>
+  <text x="85" y="290" class="note">更新後の Actor/Critic で次のrolloutを収集</text>
+</svg>

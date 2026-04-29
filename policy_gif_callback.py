@@ -244,6 +244,20 @@ def _generate_policy_gif_worker(
                     n_frames = int(shp[2]) if len(shp) == 3 else 1
                     target_hw = (int(shp[0]), int(shp[1])) if len(shp) >= 2 else (64, 64)
                 env = SuikaBitmapFrameStackWrapper(env, n_frames=n_frames, target_hw=target_hw)
+            # If model expects graph obs subset (train_gnn.py), apply the same obs wrapper for eval.
+            gnn_keys = {
+                "node",
+                "node_mask",
+                "edge",
+                "edge_index",
+                "edge_mask",
+                "current_fruit_type",
+                "next_fruit_type",
+            }
+            if gnn_keys.issubset(obs_keys):
+                from train_gnn import SuikaGnnObsWrapper
+
+                env = SuikaGnnObsWrapper(env)
             envs.append(env)
 
         frames = []

@@ -1,11 +1,17 @@
 """
-PPO training with MLP input from internal board features.
+PPO training with GNN input from graph observations.
 
-Input pipeline:
-  - Use obs["board_top50_exyir"] with shape (50, 5): [exist, x, y, id, r]
-  - Normalize x,y,id,r (x,y already in [0,1], id/11, r/256)
-  - One-hot current_hand and next_hand (11 dims each), concatenate
-  - Feed concatenated vector to MLP extractor
+Flow:
+  fruit objects
+    -> node encoder
+    -> GNN layers (3)
+    -> global pooling
+    -> board_feature
+  current_type, next_type
+    -> one-hot
+    -> hand_feature
+  concat(board_feature, hand_feature)
+    -> policy / value
 """
 
 from __future__ import annotations
@@ -42,19 +48,20 @@ from train import (
 )
 
 
-class SuikaMLPObsWrapper(gym.ObservationWrapper):
-    """Keep only board_top50_exyir and current/next hand type for MLP policy."""
+class SuikaGnnObsWrapper(gym.ObservationWrapper):
+    """Keep graph obs + current/next hand type for GNN policy."""
 
     def __init__(self, env: gym.Env):
         super().__init__(env)
         self.observation_space = spaces.Dict(
             {
-                "board_top50_exyir": spaces.Box(
-                    low=0.0,
-                    high=256.0,
-                    shape=(50, 5),
-                    dtype=np.float32,
-                ),
+                "node": spaces.Box(low=-1.0, high=1.0, shape=(50, 14), dtype=np.float32),
+                "node_mask": spaces.Box(low=0.0, high=1.0, shape=(50,), dtype=np.float32),
+                "edge": spaces.Box(low=-2.0, high=2.0, shape=(1225, 6), dtype=np.float32),
+                "edge_index": spaces.Box(low=0, high=49, shape=(1225, 2), dtype=np.int32),
+                "edge_mask": spaces.Box(low=0.0, high=1.0, shape=(1225,), dtype=np.float32),
+                "global_feature": spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32),
+                "largest_type_onehot": spaces.Box(low=0.0, high=1.0, shape=(11,), dtype=np.float32),
                 "current_fruit_type": spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
                 "next_fruit_type": spaces.Box(low=0.0, high=10.0, shape=(1,), dtype=np.float32),
             }
@@ -62,47 +69,136 @@ class SuikaMLPObsWrapper(gym.ObservationWrapper):
 
     def observation(self, observation):
         return {
-            "board_top50_exyir": observation["board_top50_exyir"].astype(np.float32, copy=False),
+            "node": observation["node"].astype(np.float32, copy=False),
+            "node_mask": observation["node_mask"].astype(np.float32, copy=False),
+            "edge": observation["edge"].astype(np.float32, copy=False),
+            "edge_index": observation["edge_index"].astype(np.int32, copy=False),
+            "edge_mask": observation["edge_mask"].astype(np.float32, copy=False),
+            "global_feature": observation["global_feature"].astype(np.float32, copy=False),
+            "largest_type_onehot": observation["largest_type_onehot"].astype(np.float32, copy=False),
             "current_fruit_type": observation["current_fruit_type"].astype(np.float32, copy=False),
             "next_fruit_type": observation["next_fruit_type"].astype(np.float32, copy=False),
         }
 
 
-class SuikaMLPExtractor(BaseFeaturesExtractor):
-    """MLP extractor over flattened normalized board features + hand one-hots."""
+class SuikaGnnExtractor(BaseFeaturesExtractor):
+    """3-layer residual message-passing GNN + hand feature concat."""
 
     def __init__(self, observation_space: spaces.Dict):
-        # board: 50 * 5 = 250, hand one-hot: 11 + 11 = 22, total 272
         super().__init__(observation_space, features_dim=256)
         self.n_hand = 11
-        in_dim = (50 * 5) + (self.n_hand * 2)
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, 512),
+        self.hidden_dim = 64
+        self.node_encoder = nn.Sequential(
+            nn.Linear(14, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(512, 256),
+            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
         )
+        self.edge_gate = nn.Sequential(
+            nn.Linear((self.hidden_dim * 2) + 6, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1),
+            nn.Sigmoid(),
+        )
+        self.gnn_layers = nn.ModuleList()
+        for _ in range(3):
+            self.gnn_layers.append(
+                nn.Sequential(
+                    nn.Linear(self.hidden_dim * 2, self.hidden_dim),
+                    nn.ReLU(),
+                    nn.Linear(self.hidden_dim, self.hidden_dim),
+                )
+            )
+        self.gnn_norms = nn.ModuleList([nn.LayerNorm(self.hidden_dim) for _ in range(3)])
+        self.hand_head = nn.Sequential(nn.Linear(self.n_hand * 2, 32), nn.ReLU())
+        self.global_head = nn.Sequential(nn.Linear(4 + 11, 32), nn.ReLU())
+        self.out = nn.Sequential(nn.Linear((self.hidden_dim * 2) + 32 + 32, 256), nn.ReLU())
+        self.edge_chunk_size = 128
         self._features_dim = 256
 
+    def _message_pass(self, h, edge_index, edge_feat, edge_mask):
+        bsz, n_nodes, dim = h.shape
+        e = edge_index.shape[1]
+        src = edge_index[:, :, 0].long()
+        dst = edge_index[:, :, 1].long()
+        base = (th.arange(bsz, device=h.device) * n_nodes).unsqueeze(1)
+        src_flat = (src + base).reshape(-1)
+        dst_flat = (dst + base).reshape(-1)
+
+        h_flat = h.reshape(bsz * n_nodes, dim)
+        agg_flat = th.zeros_like(h_flat)
+        # Chunked edge processing to avoid giant (B,E,*) tensors on MPS.
+        for s in range(0, e, self.edge_chunk_size):
+            t = min(e, s + self.edge_chunk_size)
+            src_c = src[:, s:t]
+            dst_c = dst[:, s:t]
+            src_flat_c = (src_c + base).reshape(-1)
+            dst_flat_c = (dst_c + base).reshape(-1)
+
+            h_src_c = h_flat[src_flat_c].reshape(bsz, t - s, dim)
+            h_dst_c = h_flat[dst_flat_c].reshape(bsz, t - s, dim)
+            edge_c = edge_feat[:, s:t, :]
+            edge_mask_c = edge_mask[:, s:t].unsqueeze(-1)
+
+            gate_in = th.cat([h_src_c, h_dst_c, edge_c], dim=-1)
+            gate_in = th.nan_to_num(gate_in, nan=0.0, posinf=1e3, neginf=-1e3)
+            gate = self.edge_gate(gate_in) * edge_mask_c
+            gate = th.nan_to_num(gate, nan=0.0, posinf=1.0, neginf=0.0)
+
+            msg_src_to_dst = h_src_c * gate
+            msg_dst_to_src = h_dst_c * gate
+
+            agg_flat.index_add_(0, dst_flat_c, msg_src_to_dst.reshape(-1, dim))
+            agg_flat.index_add_(0, src_flat_c, msg_dst_to_src.reshape(-1, dim))
+        out = agg_flat.reshape(bsz, n_nodes, dim)
+        return th.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
+
     def forward(self, observations):
-        exyir = observations["board_top50_exyir"].float()  # (B,50,5)
-        exist = exyir[:, :, 0:1]  # 0/1
-        x = exyir[:, :, 1:2]  # already 0..1
-        y = exyir[:, :, 2:3]  # already 0..1
-        fruit_id = exyir[:, :, 3:4] / 11.0  # 0..11 -> 0..1
-        radius = exyir[:, :, 4:5] / 256.0  # pixel radius -> ~0..1
-        board_feat = th.cat([exist, x, y, fruit_id, radius], dim=2).reshape(exyir.shape[0], -1)
+        node = th.nan_to_num(observations["node"].float(), nan=0.0, posinf=1.0, neginf=-1.0)
+        node_mask = th.nan_to_num(observations["node_mask"].float(), nan=0.0, posinf=1.0, neginf=0.0)
+        edge = th.nan_to_num(observations["edge"].float(), nan=0.0, posinf=2.0, neginf=-2.0)
+        edge_index = observations["edge_index"].long()
+        edge_mask = th.nan_to_num(observations["edge_mask"].float(), nan=0.0, posinf=1.0, neginf=0.0)
+
+        h = self.node_encoder(node)
+        h = th.nan_to_num(h, nan=0.0, posinf=1e6, neginf=-1e6)
+        h = h * node_mask.unsqueeze(-1)
+        for layer, norm in zip(self.gnn_layers, self.gnn_norms):
+            agg = self._message_pass(h, edge_index, edge, edge_mask)
+            h_res = layer(th.cat([h, agg], dim=-1))
+            h_res = th.nan_to_num(h_res, nan=0.0, posinf=1e6, neginf=-1e6)
+            h = F.relu(norm(h + h_res))
+            h = th.nan_to_num(h, nan=0.0, posinf=1e6, neginf=-1e6)
+            h = h * node_mask.unsqueeze(-1)
+
+        denom = th.clamp(node_mask.sum(dim=1, keepdim=True), min=1.0)
+        board_mean = (h * node_mask.unsqueeze(-1)).sum(dim=1) / denom
+        very_neg = th.full_like(h, -1e4)
+        h_masked_for_max = th.where(node_mask.unsqueeze(-1) > 0.5, h, very_neg)
+        board_max = h_masked_for_max.max(dim=1).values
+        has_node = (node_mask.sum(dim=1, keepdim=True) > 0.5)
+        board_max = th.where(has_node, board_max, th.zeros_like(board_max))
+        board_max = th.where(th.isfinite(board_max), board_max, th.zeros_like(board_max))
+        board_feature = th.cat([board_mean, board_max], dim=1)
 
         cur_idx = observations["current_fruit_type"].long().squeeze(1).clamp(0, self.n_hand - 1)
         nxt_idx = observations["next_fruit_type"].long().squeeze(1).clamp(0, self.n_hand - 1)
         cur_onehot = F.one_hot(cur_idx, num_classes=self.n_hand).float()
         nxt_onehot = F.one_hot(nxt_idx, num_classes=self.n_hand).float()
+        hand_feature = self.hand_head(th.cat([cur_onehot, nxt_onehot], dim=1))
+        global_in = th.cat(
+            [
+                th.nan_to_num(observations["global_feature"].float(), nan=0.0, posinf=1.0, neginf=0.0),
+                th.nan_to_num(observations["largest_type_onehot"].float(), nan=0.0, posinf=1.0, neginf=0.0),
+            ],
+            dim=1,
+        )
+        global_feature = self.global_head(global_in)
+        out = self.out(th.cat([board_feature, hand_feature, global_feature], dim=1))
+        return th.nan_to_num(out, nan=0.0, posinf=1e6, neginf=-1e6)
 
-        feat = th.cat([board_feat, cur_onehot, nxt_onehot], dim=1)
-        return self.mlp(feat)
 
-
-def make_env_mlp(
+def make_env_gnn(
     rank: int,
     seed: int,
     headless: bool,
@@ -125,7 +221,7 @@ def make_env_mlp(
         if env_id == "SuikaEnv-v0":
             env_kwargs["port"] = port_base + rank
         env = gym.make(env_id, **env_kwargs)
-        env = SuikaMLPObsWrapper(env)
+        env = SuikaGnnObsWrapper(env)
         env.reset(seed=seed + rank)
         return env
 
@@ -135,7 +231,7 @@ def make_env_mlp(
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--total-timesteps", type=int, default=200_000)
-    p.add_argument("--n-envs", type=int, default=16)
+    p.add_argument("--n-envs", type=int, default=8)
     p.add_argument("--n-steps", type=int, default=512)
     p.add_argument("--rollout-steps-total", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
@@ -148,7 +244,7 @@ def parse_args():
     p.add_argument("--port-base", type=int, default=8923)
     p.add_argument("--headless", action="store_true", default=True)
     p.add_argument("--no-headless", action="store_false", dest="headless")
-    p.add_argument("--save-path", type=Path, default=Path("models/mlp/ppo_suika_mlp"))
+    p.add_argument("--save-path", type=Path, default=Path("models/gnn/ppo_suika_gnn"))
     p.add_argument("--wandb-project", type=str, default="suika-rl")
     p.add_argument("--wandb-entity", type=str, default=None)
     p.add_argument("--wandb-run-name", type=str, default=None)
@@ -157,7 +253,7 @@ def parse_args():
     p.add_argument("--gif-eval-every-steps", type=int, default=10_000)
     p.add_argument("--gif-eval-steps", type=int, default=10000)
     p.add_argument("--gif-fps", type=int, default=20)
-    p.add_argument("--gif-dir", type=Path, default=Path("gifs/mlp"))
+    p.add_argument("--gif-dir", type=Path, default=Path("gifs/gnn"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
     p.add_argument(
@@ -188,18 +284,15 @@ def main():
     if args.rollout_steps_total > 0:
         effective_n_steps = max(1, args.rollout_steps_total // args.n_envs)
     effective_rollout_total = effective_n_steps * args.n_envs
-    print(
-        f"[train_mlp] n_envs={args.n_envs}, n_steps={effective_n_steps}, "
-        f"rollout_total={effective_rollout_total}"
-    )
+    print(f"[train_gnn] n_envs={args.n_envs}, n_steps={effective_n_steps}, rollout_total={effective_rollout_total}")
 
     wandb_enabled = bool(args.wandb_run_name)
-    run_name = args.wandb_run_name or f"ppo-suika-mlp-seed{args.seed}"
+    run_name = args.wandb_run_name or f"ppo-suika-gnn-seed{args.seed}"
     tb_dir = Path("runs/tb") / run_name
     tb_dir.mkdir(parents=True, exist_ok=True)
 
     env_fns = [
-        make_env_mlp(
+        make_env_gnn(
             i,
             args.seed,
             args.headless,
@@ -212,7 +305,7 @@ def main():
         env = env_fns[0]()
         try:
             obs, _ = env.reset(seed=args.seed)
-            print("[check] model input preview (train_mlp.py)")
+            print("[check] model input preview (train_gnn.py)")
             for k, v in obs.items():
                 arr = np.asarray(v)
                 print(
@@ -233,8 +326,8 @@ def main():
             name=run_name,
             config={
                 "algo": "PPO",
-                "extractor": "MLP",
-                "obs": "board_top50_exyir + hand_onehot",
+                "extractor": "GNN",
+                "obs": "graph(node/edge) + hand_onehot",
                 "env_id": args.env_id,
                 "total_timesteps": args.total_timesteps,
                 "n_envs": args.n_envs,
@@ -242,11 +335,11 @@ def main():
                 "learning_rate": 1e-4,
                 "n_steps": effective_n_steps,
                 "rollout_steps_total": effective_rollout_total,
-                "batch_size": 1024,
+                "batch_size": 256,
                 "gamma": 0.99,
                 "gae_lambda": 0.95,
                 "clip_range": 0.2,
-                "ent_coef": 0.05,
+                "ent_coef": 0.01,
                 "vf_coef": 0.5,
                 "max_grad_norm": 0.5,
                 "device": actual_device,
@@ -267,7 +360,7 @@ def main():
     interrupted = False
     try:
         if args.resume_path is not None:
-            print(f"[train_mlp] Resuming from: {args.resume_path}")
+            print(f"[train_gnn] Resuming from: {args.resume_path}")
             model = PPO.load(
                 str(args.resume_path),
                 env=vec_env,
@@ -278,16 +371,16 @@ def main():
                 "MultiInputPolicy",
                 vec_env,
                 policy_kwargs=dict(
-                    features_extractor_class=SuikaMLPExtractor,
+                    features_extractor_class=SuikaGnnExtractor,
                     share_features_extractor=False,
                 ),
                 learning_rate=1e-4,
                 n_steps=effective_n_steps,
-                batch_size=1024,
+                batch_size=256,
                 gamma=0.99,
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=0.05,
+                ent_coef=0.01,
                 vf_coef=0.5,
                 max_grad_norm=0.5,
                 tensorboard_log=str(tb_dir),
