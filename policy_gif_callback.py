@@ -160,23 +160,20 @@ def _load_model(model_path: str, algo: str):
 def _map_action_for_env(model, action: np.ndarray, algo: str):
     """
     Map model action to env action.
-    - PPO: pass through.
-    - DQN: discrete idx -> centered continuous x in [-1, 1].
+    - If action space is discrete (DQN or PPO+discrete wrapper):
+      idx -> centered continuous x in [-1, 1].
+    - Otherwise: pass through continuous action.
     Returns: (env_action, logged_x, logged_idx)
     """
-    algo_l = str(algo).lower()
     arr = np.asarray(action).reshape(-1)
     if arr.size == 0:
         return np.asarray([0.0], dtype=np.float32), float("nan"), -1
 
-    if algo_l == "dqn":
+    n = int(getattr(model.action_space, "n", 0))
+    if n > 1:
         idx = int(arr[0])
-        n = int(getattr(model.action_space, "n", 0))
-        if n <= 1:
-            x = 0.0
-        else:
-            t = float(np.clip(idx, 0, n - 1)) / float(n - 1)
-            x = float((2.0 * t) - 1.0)
+        t = float(np.clip(idx, 0, n - 1)) / float(n - 1)
+        x = float((2.0 * t) - 1.0)
         return np.asarray([x], dtype=np.float32), float(x), int(idx)
 
     x = float(arr[0])
@@ -232,18 +229,22 @@ def _generate_policy_gif_worker(
         for raw_env in raw_envs:
             env = raw_env
             if "bitmap" in obs_keys and "hand_onehot" in obs_keys:
-                from train_bitmap import SuikaBitmapFrameStackWrapper
+                try:
+                    from train_bitmap import SuikaBitmapObsWrapper
+                except ImportError:
+                    SuikaBitmapObsWrapper = None
 
                 bitmap_space = model.observation_space.spaces["bitmap"]
                 shp = tuple(int(v) for v in bitmap_space.shape)
-                # Support both HWC and CHW bitmap spaces.
-                if len(shp) == 3 and shp[0] <= 16 and shp[1] > 16 and shp[2] > 16:
-                    n_frames = int(shp[0])
-                    target_hw = (int(shp[1]), int(shp[2]))
+                target_hw = (int(shp[0]), int(shp[1])) if len(shp) >= 2 else (96, 96)
+                if SuikaBitmapObsWrapper is not None:
+                    env = SuikaBitmapObsWrapper(env, target_hw=target_hw)
                 else:
+                    # Backward compatibility for older code paths.
+                    from train_bitmap import SuikaBitmapFrameStackWrapper
+
                     n_frames = int(shp[2]) if len(shp) == 3 else 1
-                    target_hw = (int(shp[0]), int(shp[1])) if len(shp) >= 2 else (64, 64)
-                env = SuikaBitmapFrameStackWrapper(env, n_frames=n_frames, target_hw=target_hw)
+                    env = SuikaBitmapFrameStackWrapper(env, n_frames=n_frames, target_hw=target_hw)
             # If model expects graph obs subset (train_gnn.py), apply the same obs wrapper for eval.
             gnn_keys = {
                 "node",

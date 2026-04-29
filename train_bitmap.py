@@ -2,7 +2,7 @@
 PPO training (Bitmap + hand one-hot) for SuikaEnv-v0 / SuikaEnvNode-v0.
 
 Input design:
-  - bitmap: 64x64 single-frame semantic map from obs["bitmap"]
+  - bitmap: 96x96 single-frame semantic map from obs["bitmap"]
   - hand_onehot: concat(one-hot(current_fruit_type), one-hot(next_fruit_type))
   - extractor: CNN(board_feature) + hand concat -> PPO
   - actor/critic use separate feature extractors (share_features_extractor=False)
@@ -44,7 +44,7 @@ from train import (
 class SuikaBitmapObsWrapper(gym.ObservationWrapper):
     """Build bitmap+hand observation for PPO from env raw observation."""
 
-    def __init__(self, env: gym.Env, target_hw: tuple[int, int] = (64, 64)):
+    def __init__(self, env: gym.Env, target_hw: tuple[int, int] = (96, 96)):
         super().__init__(env)
         self.target_h, self.target_w = int(target_hw[0]), int(target_hw[1])
         self._n_fruit_types = 11
@@ -94,6 +94,28 @@ class SuikaBitmapObsWrapper(gym.ObservationWrapper):
             "bitmap": frame,
             "hand_onehot": self._build_hand_onehot(obs),
         }
+
+
+class DiscreteActionWrapper(gym.Wrapper):
+    """Map discrete action index to centered continuous x in [-1, 1]."""
+
+    def __init__(self, env: gym.Env, n_bins: int = 32):
+        super().__init__(env)
+        self.n_bins = max(2, int(n_bins))
+        self.action_space = spaces.Discrete(self.n_bins)
+
+    def _idx_to_x(self, idx: int) -> float:
+        t = float(np.clip(idx, 0, self.n_bins - 1)) / float(self.n_bins - 1)
+        return float((2.0 * t) - 1.0)
+
+    def step(self, action):
+        idx = int(np.asarray(action).reshape(-1)[0])
+        x = self._idx_to_x(idx)
+        obs, reward, terminated, truncated, info = self.env.step(np.array([x], dtype=np.float32))
+        info = dict(info)
+        info["action_x"] = x
+        info["action_idx"] = idx
+        return obs, reward, terminated, truncated, info
 
 
 class SuikaBitmapCoordConvExtractor(BaseFeaturesExtractor):
@@ -169,6 +191,7 @@ def make_env_bitmap(
     headless: bool,
     port_base: int,
     env_id: str,
+    discrete: bool,
 ) -> Callable[[], gym.Env]:
     def _init() -> gym.Env:
         env_kwargs = dict(
@@ -186,7 +209,9 @@ def make_env_bitmap(
         if env_id == "SuikaEnv-v0":
             env_kwargs["port"] = port_base + rank
         env = gym.make(env_id, **env_kwargs)
-        env = SuikaBitmapObsWrapper(env, target_hw=(64, 64))
+        env = SuikaBitmapObsWrapper(env, target_hw=(96, 96))
+        if discrete:
+            env = DiscreteActionWrapper(env, n_bins=32)
         return env
 
     return _init
@@ -220,6 +245,7 @@ def parse_args():
     p.add_argument("--gif-dir", type=Path, default=Path("gifs/bitmap"))
     p.add_argument("--device", type=str, default="cuda", help="auto|cpu|cuda|mps")
     p.add_argument("--gpu-id", type=int, default=None)
+    p.add_argument("--discrete", action="store_true", default=False, help="Use 32-bin discrete action space.")
     p.add_argument("--check", type=lambda x: str(x).lower() == "true", default=False)
     return p.parse_args()
 
@@ -229,6 +255,8 @@ def main():
     actual_device = resolve_device(args.device)
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    if args.discrete and str(args.gif_dir) == "gifs/bitmap":
+        args.gif_dir = Path("gifs/bitmap-dis")
 
     args.save_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -253,6 +281,7 @@ def main():
             args.headless,
             args.port_base,
             args.env_id,
+            args.discrete,
         )
         for i in range(args.n_envs)
     ]
@@ -294,7 +323,7 @@ def main():
                 "gamma": 0.99,
                 "gae_lambda": 0.95,
                 "clip_range": 0.2,
-                "ent_coef": 0.05,
+                "ent_coef": 0.01,
                 "vf_coef": 0.5,
                 "max_grad_norm": 0.5,
                 "device": actual_device,
@@ -304,6 +333,7 @@ def main():
                 "gif_eval_every_steps": args.gif_eval_every_steps,
                 "gif_eval_steps": args.gif_eval_steps,
                 "gif_fps": args.gif_fps,
+                "discrete": args.discrete,
             },
             sync_tensorboard=True,
             monitor_gym=False,
@@ -325,7 +355,7 @@ def main():
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            ent_coef=0.05,
+            ent_coef=0.01,
             vf_coef=0.5,
             max_grad_norm=0.5,
             tensorboard_log=str(tb_dir),
